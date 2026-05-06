@@ -52,9 +52,11 @@ pub fn build_router(state: SharedState) -> AxumRouter {
         .route("/api/pricing", post(handle_update_pricing))
         .route("/api/spend",   get(handle_spend))
         // Federation endpoints
-        .route("/v1/federation/lookup/:hash", get(handle_federation_lookup))
-        .route("/v1/federation/announce",     post(handle_federation_announce))
-        .route("/v1/federation/peers",        get(handle_federation_peers))
+        .route("/v1/federation/lookup/:hash",  get(handle_federation_lookup))
+        .route("/v1/federation/announce",      post(handle_federation_announce))
+        .route("/v1/federation/peers",         get(handle_federation_peers))
+        .route("/v1/federation/revocations",   get(handle_get_revocations)
+                                               .post(handle_receive_revocation))
         // Trust management
         .route("/v1/trust",                   get(handle_trust_list))
         .route("/v1/trust/:node_id",          post(handle_trust_promote))
@@ -336,6 +338,17 @@ async fn handle_federation_announce(
         "federation announce from trusted node {} ({} hashes)",
         &payload.node_id[..16], payload.hashes.len()
     );
+
+    // Pull revocations from this peer in the background so we stay in sync
+    {
+        let fed   = state.federation.clone();
+        let cache = state.cache.clone();
+        let url   = payload.url.clone();
+        tokio::spawn(async move {
+            fed.pull_revocations_from_url(&url, &cache).await;
+        });
+    }
+
     Json(json!({ "ok": true, "status": "trusted", "received": payload.hashes.len() })).into_response()
 }
 
@@ -386,12 +399,47 @@ async fn handle_evict(
     Json(body):    Json<EvictBody>,
 ) -> Response {
     // Sign the revocation with our own identity key
-    let revocation_msg = format!("evict|{}|{}", node_id, body.reason);
-    let sig = state.identity.sign(revocation_msg.as_bytes());
+    let revocation_msg = crate::identity::revocation_message(&node_id, &body.reason);
+    let sig = state.identity.sign(&revocation_msg);
 
     match state.trust.evict(&node_id, &body.reason, &state.node_id, &sig, &state.cache).await {
-        Ok(_) => Json(json!({ "ok": true, "node_id": node_id, "evicted": true })).into_response(),
+        Ok(_) => {
+            // Push revocation to all trusted peers immediately
+            let revocations = state.trust.list_revocations().await.unwrap_or_default();
+            if let Some(rev) = revocations.iter().find(|r| r.node_id == node_id) {
+                let fed   = state.federation.clone();
+                let rev_c = rev.clone();
+                tokio::spawn(async move { fed.push_revocation_to_peers(&rev_c).await });
+            }
+            Json(json!({ "ok": true, "node_id": node_id, "evicted": true })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ── Revocation gossip endpoints ────────────────────────────────────────────
+
+async fn handle_get_revocations(State(state): State<SharedState>) -> Json<Value> {
+    let revocations = state.trust.list_revocations().await.unwrap_or_default();
+    Json(json!({ "revocations": revocations }))
+}
+
+async fn handle_receive_revocation(
+    State(state): State<SharedState>,
+    Json(rev):    Json<crate::trust::RevocationRecord>,
+) -> Response {
+    match state.trust.apply_incoming_revocation(&rev, &state.cache).await {
+        Ok(true) => {
+            info!("applied incoming revocation for {}", &rev.node_id[..16.min(rev.node_id.len())]);
+            // Do NOT re-push — one-hop push prevents broadcast storms.
+            // Peers can pull from us via GET /v1/federation/revocations.
+            Json(json!({ "ok": true, "applied": true })).into_response()
+        }
+        Ok(false) => Json(json!({ "ok": true, "applied": false })).into_response(),
+        Err(e) => {
+            warn!("revocation apply error: {e}");
+            (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        }
     }
 }
 

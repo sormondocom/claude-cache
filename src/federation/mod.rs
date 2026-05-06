@@ -10,11 +10,11 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::cache::CacheEntry;
+use crate::cache::{CacheEntry, CacheStore};
 use crate::identity::{announce_message, NodeIdentity, RemoteKey};
-use crate::trust::TrustStore;
+use crate::trust::{RevocationRecord, TrustStore};
 
 // ── Wire types ─────────────────────────────────────────────────────────────
 
@@ -200,6 +200,67 @@ impl FederationClient {
                 let _ = client.post(&url).json(&b).send().await;
             });
         }
+    }
+
+    // ── Revocation gossip ────────────────────────────────────────────────────
+
+    /// Push a signed revocation to all currently trusted peers (fire-and-forget).
+    /// Called immediately after a local eviction so the mesh learns fast.
+    pub async fn push_revocation_to_peers(&self, rev: &RevocationRecord) {
+        if !self.enabled || self.peers.is_empty() {
+            return;
+        }
+        let body = match serde_json::to_value(rev) {
+            Ok(v)  => v,
+            Err(e) => { warn!("revocation serialize error: {e}"); return; }
+        };
+        for peer in &self.peers {
+            if !self.trust.is_trusted(&peer.id).await {
+                continue; // only push to peers we trust
+            }
+            let url    = format!("{}/v1/federation/revocations", peer.url);
+            let client = self.client.clone();
+            let b      = body.clone();
+            tokio::spawn(async move {
+                let _ = client.post(&url).json(&b).send().await;
+            });
+        }
+    }
+
+    /// Pull revocations from a single peer URL and apply any that are new and valid.
+    /// Used both on startup sync and after receiving an announce.
+    pub async fn pull_revocations_from_url(&self, peer_url: &str, cache: &CacheStore) -> usize {
+        let url = format!("{}/v1/federation/revocations", peer_url);
+        let revocations: Vec<RevocationRecord> = match self.client.get(&url).send().await {
+            Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+            _ => return 0,
+        };
+        let mut applied = 0usize;
+        for rev in &revocations {
+            match self.trust.apply_incoming_revocation(rev, cache).await {
+                Ok(true) => {
+                    info!("applied revocation for {} (from {})", &rev.node_id[..16.min(rev.node_id.len())], peer_url);
+                    applied += 1;
+                }
+                Ok(false) => {}
+                Err(e) => warn!("revocation apply error: {e}"),
+            }
+        }
+        applied
+    }
+
+    /// Pull revocations from all trusted peers.  Called hourly and on startup.
+    pub async fn sync_revocations(&self, cache: &CacheStore) -> usize {
+        if !self.enabled || self.peers.is_empty() {
+            return 0;
+        }
+        let mut total = 0usize;
+        for peer in &self.peers {
+            if self.trust.is_trusted(&peer.id).await {
+                total += self.pull_revocations_from_url(&peer.url, cache).await;
+            }
+        }
+        total
     }
 
     pub fn peer_count(&self) -> usize {

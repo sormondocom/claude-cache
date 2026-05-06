@@ -221,6 +221,46 @@ impl TrustStore {
         }
     }
 
+    /// Apply a revocation received from a peer.
+    /// Verifies that `revoked_by` is a trusted node with a known key before applying.
+    /// Returns `true` if the revocation was newly applied, `false` if already known or invalid.
+    pub async fn apply_incoming_revocation(
+        &self,
+        rev: &RevocationRecord,
+        cache: &CacheStore,
+    ) -> Result<bool> {
+        // Already handled — idempotent
+        if self.is_evicted(&rev.node_id).await {
+            return Ok(false);
+        }
+
+        // The node that issued the revocation must be trusted by us
+        if !self.is_trusted(&rev.revoked_by).await {
+            warn!(
+                "revocation from untrusted node {} ignored (target: {})",
+                &rev.revoked_by[..16.min(rev.revoked_by.len())],
+                &rev.node_id[..16.min(rev.node_id.len())]
+            );
+            return Ok(false);
+        }
+
+        // Verify the signature using the revoker's stored public key
+        let Some(key) = self.get_public_key(&rev.revoked_by).await? else {
+            warn!("no public key on record for revoker {}", &rev.revoked_by[..16.min(rev.revoked_by.len())]);
+            return Ok(false);
+        };
+
+        let msg = crate::identity::revocation_message(&rev.node_id, &rev.reason);
+        if let Err(e) = key.verify(&msg, &rev.signature) {
+            warn!("revocation signature invalid: {e}");
+            return Ok(false);
+        }
+
+        // Apply — use the original revoker as actor, preserve their signature
+        self.evict(&rev.node_id, &rev.reason, &rev.revoked_by, &rev.signature, cache).await?;
+        Ok(true)
+    }
+
     pub async fn list_all(&self) -> Result<Vec<NodeRecord>> {
         let rows = sqlx::query(
             "SELECT node_id, public_key_hex, url, is_head, trust_state, signed_by,

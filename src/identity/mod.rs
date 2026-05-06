@@ -137,6 +137,12 @@ pub fn fingerprint_of(pubkey_bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+/// Canonical message to sign when revoking a node.
+/// Format is deterministic so any verifier can reconstruct it.
+pub fn revocation_message(node_id: &str, reason: &str) -> Vec<u8> {
+    format!("revoke|{}|{}", node_id, reason).into_bytes()
+}
+
 /// Canonical message to sign for an announce payload.
 /// Format: `node_id|url|public_key_hex\n<newline-joined sorted hashes>`
 /// Using a deterministic text format avoids JSON serialization ambiguity.

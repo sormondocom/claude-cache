@@ -79,7 +79,17 @@ async fn main() -> Result<()> {
         api_backend,
     );
 
-    // ── Background: eviction + gossip ─────────────────────────────────────
+    // ── Startup: pull revocations from known peers ────────────────────────
+    {
+        let fed_sync   = federation.clone();
+        let cache_sync = cache.clone();
+        tokio::spawn(async move {
+            let applied = fed_sync.sync_revocations(&cache_sync).await;
+            if applied > 0 { info!("startup: applied {applied} revocations from peers"); }
+        });
+    }
+
+    // ── Background: eviction + gossip + revocation sync ───────────────────
     {
         let evict_cache = cache.clone();
         let fed         = federation.clone();
@@ -91,10 +101,11 @@ async fn main() -> Result<()> {
                 if let Ok(n) = evict_cache.evict_expired().await {
                     if n > 0 { info!("evicted {n} expired cache entries"); }
                 }
-                // Gossip shared hashes to peers
                 if let Ok(hashes) = evict_cache.list_shared_hashes(500, 0).await {
                     fed.announce(hashes, &our_url).await;
                 }
+                let applied = fed.sync_revocations(&evict_cache).await;
+                if applied > 0 { info!("hourly sync: applied {applied} revocations from peers"); }
             }
         });
     }
