@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($env:CARGO_TARGET_DIR = \"D:\\\\rust\\\\cargo\"; Set-Location \"D:\\\\claude-cache\"; cargo check 2>&1)"
+    ]
+  }
+}
