@@ -12,15 +12,21 @@ pub struct AppConfig {
     pub routing:    RoutingConfig,
     pub budget:     BudgetConfig,
     pub federation: FederationConfig,
+    #[serde(default)]
+    pub node:       NodeConfig,
+    #[serde(default)]
+    pub health:     HealthConfig,
 }
+
+// ── Server ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
-    pub host:    String,
-    pub port:    u16,
-    #[serde(default)]
-    pub node_id: String,
+    pub host: String,
+    pub port: u16,
 }
+
+// ── API / Local / Embedding / Cache / Routing / Budget ──────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApiConfig {
@@ -30,12 +36,12 @@ pub struct ApiConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LocalConfig {
-    pub enabled:         bool,
-    pub backend:         String,
-    pub base_url:        String,
-    pub model_id:        String,
+    pub enabled:          bool,
+    pub backend:          String,
+    pub base_url:         String,
+    pub model_id:         String,
     pub confidence_floor: f64,
-    pub timeout_secs:    u64,
+    pub timeout_secs:     u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -72,42 +78,115 @@ pub struct BudgetConfig {
     pub output_per_1k_usd: f64,
 }
 
+// ── Federation ───────────────────────────────────────────────────────────────
+
+/// A statically-configured federation peer.  The `node_id` (Ed25519 fingerprint)
+/// is required and obtained by running `claude-cache identity` on the peer.
+/// `public_key_hex` is optional but strongly recommended — without it, federated
+/// responses from this peer cannot be signature-verified until after their first
+/// announce reaches us.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PeerConfig {
+    pub url:     String,
+    pub node_id: String,
+    #[serde(default)]
+    pub public_key_hex: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FederationConfig {
     pub enabled:           bool,
     pub share_cache:       bool,
-    pub peers:             Vec<String>,
+    #[serde(default)]
+    pub peers:             Vec<PeerConfig>,
     pub lookup_timeout_ms: u64,
 }
+
+// ── Health checks ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HealthConfig {
+    /// Enable background peer health checks.
+    pub enabled:           bool,
+    /// How often to check each peer (seconds).
+    pub interval_secs:     u64,
+    /// HTTP timeout per health check request (milliseconds).
+    pub timeout_ms:        u64,
+    /// Number of consecutive failures before a peer is marked unreachable.
+    pub failure_threshold: u32,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        HealthConfig {
+            enabled:           true,
+            interval_secs:     60,
+            timeout_ms:        2000,
+            failure_threshold: 3,
+        }
+    }
+}
+
+// ── Node role ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeRole {
+    /// Command-and-control node: head node, can counter-sign peers, optional
+    /// auto-promote.  Typically runs with higher budget and always reaches the
+    /// Anthropic API directly (no local model routing for CNC responses).
+    Cnc,
+    /// Standard client node.  Participates in the mesh, routes through the
+    /// local cascade, can bootstrap trust from a CNC.
+    Client,
+}
+
+impl Default for NodeRole {
+    fn default() -> Self { NodeRole::Client }
+}
+
+/// Node-level identity and bootstrapping config.  All fields are optional and
+/// default to "plain client" behaviour when omitted.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NodeConfig {
+    /// Role of this node in the federation mesh.
+    #[serde(default)]
+    pub role: NodeRole,
+
+    /// CNC only: automatically promote every announcing peer to trusted.
+    /// Keep false in production; use manual `POST /v1/trust/:node_id` instead.
+    #[serde(default)]
+    pub auto_promote_peers: bool,
+
+    /// Client only: URL of the CNC node to announce to at startup.
+    #[serde(default)]
+    pub cnc_url: String,
+
+    /// Client only: Ed25519 fingerprint of the CNC node.  Required when
+    /// `cnc_url` is set so we can auto-trust the CNC on first contact.
+    #[serde(default)]
+    pub cnc_node_id: String,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        NodeConfig {
+            role:               NodeRole::Client,
+            auto_promote_peers: false,
+            cnc_url:            String::new(),
+            cnc_node_id:        String::new(),
+        }
+    }
+}
+
+// ── AppConfig ─────────────────────────────────────────────────────────────────
 
 impl AppConfig {
     pub fn load(path: &str) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config from {path}"))?;
-        let mut cfg: AppConfig = toml::from_str(&text)
-            .with_context(|| "parsing config.toml")?;
-
-        if cfg.server.node_id.is_empty() {
-            cfg.server.node_id = uuid::Uuid::new_v4().to_string();
-            cfg.persist_node_id(path)?;
-        }
-        Ok(cfg)
-    }
-
-    /// Write the generated node_id back into config.toml so it persists across restarts.
-    fn persist_node_id(&self, path: &str) -> Result<()> {
-        let text = std::fs::read_to_string(path)?;
-        let new_text = if text.contains("node_id = \"\"") {
-            text.replace(
-                "node_id = \"\"",
-                &format!("node_id = \"{}\"", self.server.node_id),
-            )
-        } else {
-            // Append under [server] — simple best-effort
-            text
-        };
-        std::fs::write(path, new_text)?;
-        Ok(())
+        toml::from_str(&text)
+            .with_context(|| "parsing config.toml")
     }
 
     pub fn domain_ttl(&self, domain: &str) -> u64 {
@@ -131,9 +210,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
             server: ServerConfig {
-                host:    "127.0.0.1".into(),
-                port:    3000,
-                node_id: String::new(),
+                host: "127.0.0.1".into(),
+                port: 3000,
             },
             api: ApiConfig {
                 model:    "claude-sonnet-4-6".into(),
@@ -178,6 +256,8 @@ impl Default for AppConfig {
                 peers:             Vec::new(),
                 lookup_timeout_ms: 500,
             },
+            node:   NodeConfig::default(),
+            health: HealthConfig::default(),
         }
     }
 }

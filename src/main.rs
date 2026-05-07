@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use anyhow::Result;
+use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use claude_cache::{
@@ -7,17 +9,107 @@ use claude_cache::{
     backend::{AnthropicBackend, ModelBackend, OllamaBackend},
     budget::BudgetLedger,
     cache::CacheStore,
-    config::AppConfig,
+    config::{AppConfig, NodeRole},
     embedding::{Embedder, OllamaEmbedder, StubEmbedder},
-    federation::{FederationClient, peers_from_urls},
+    federation::{AnnouncePayload, FederationClient, peers_from_config},
+    health,
     identity::NodeIdentity,
     router::Router,
     server::{AppState, build_router},
     trust::TrustStore,
 };
 
+// ── CLI ────────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(
+    name    = "claude-cache",
+    about   = "Anthropic API cache and routing proxy",
+    version
+)]
+struct Cli {
+    /// Path to config file
+    #[arg(long, default_value = "config.toml", global = true)]
+    config: String,
+
+    /// Override node role: cnc or client
+    #[arg(long)]
+    role: Option<String>,
+
+    /// CNC URL for client boot-strapping (overrides config)
+    #[arg(long)]
+    cnc_url: Option<String>,
+
+    /// CNC Ed25519 fingerprint for client bootstrapping (overrides config)
+    #[arg(long)]
+    cnc_node_id: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Print this node's stable Ed25519 fingerprint and public key, then exit.
+    /// Run this on any node to get the value to put in a peer's config.toml.
+    Identity {
+        /// Path to key file (default: node_identity.key)
+        #[arg(long, default_value = "node_identity.key")]
+        key_file: String,
+    },
+}
+
+// ── Counter-signature persistence ──────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct CounterSigFile {
+    counter_node_id:  String,
+    counter_signature: String,
+}
+
+fn load_countersig(path: &str) -> (Option<String>, Option<String>) {
+    let Ok(text) = std::fs::read_to_string(path) else { return (None, None); };
+    let Ok(csf)  = serde_json::from_str::<CounterSigFile>(&text) else { return (None, None); };
+    (Some(csf.counter_node_id), Some(csf.counter_signature))
+}
+
+fn save_countersig(path: &str, counter_node_id: &str, counter_signature: &str) {
+    let csf = CounterSigFile {
+        counter_node_id:   counter_node_id.to_string(),
+        counter_signature: counter_signature.to_string(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&csf) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+// ── Entry point ────────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Command::Identity { key_file }) => {
+            let id = NodeIdentity::load_or_generate(&key_file)?;
+            println!("fingerprint: {}", id.fingerprint);
+            println!("public_key:  {}", id.public_key_hex);
+            return Ok(());
+        }
+        None => {
+            run_server(cli.config, cli.role, cli.cnc_url, cli.cnc_node_id).await
+        }
+    }
+}
+
+// ── Server ─────────────────────────────────────────────────────────────────────
+
+async fn run_server(
+    config_path: String,
+    role_override: Option<String>,
+    cnc_url_override: Option<String>,
+    cnc_node_id_override: Option<String>,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -25,15 +117,29 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cfg = Arc::new(AppConfig::load("config.toml").unwrap_or_else(|e| {
+    let mut cfg = AppConfig::load(&config_path).unwrap_or_else(|e| {
         tracing::warn!("config.toml not found ({e}), using defaults");
         AppConfig::default()
-    }));
+    });
+
+    // Apply CLI overrides to node config
+    if let Some(role_str) = role_override {
+        cfg.node.role = match role_str.to_lowercase().as_str() {
+            "cnc" => NodeRole::Cnc,
+            _     => NodeRole::Client,
+        };
+    }
+    if let Some(url) = cnc_url_override     { cfg.node.cnc_url     = url; }
+    if let Some(nid) = cnc_node_id_override { cfg.node.cnc_node_id = nid; }
+
+    let cfg = Arc::new(cfg);
+    let is_cnc = cfg.node.role == NodeRole::Cnc;
 
     // ── Node identity ─────────────────────────────────────────────────────
     let identity = Arc::new(NodeIdentity::load_or_generate("node_identity.key")?);
-    info!("node identity: {}", &identity.fingerprint[..16]);
-    info!("public key:    {}", identity.public_key_hex);
+    info!("node fingerprint: {}", &identity.fingerprint[..16]);
+    info!("public key:       {}", identity.public_key_hex);
+    if is_cnc { info!("role: CNC (head node)"); } else { info!("role: client"); }
 
     // ── Credentials ───────────────────────────────────────────────────────
     let creds = auth::load()?;
@@ -42,6 +148,51 @@ async fn main() -> Result<()> {
     let cache  = Arc::new(CacheStore::open(&cfg.cache.db_path, &identity.fingerprint).await?);
     let budget = Arc::new(BudgetLedger::open(cfg.budget.clone()).await?);
     let trust  = Arc::new(TrustStore::open("claude-cache.trust.db", &identity.fingerprint).await?);
+
+    let our_url = format!("http://{}:{}", cfg.server.host, cfg.server.port);
+
+    // ── Bootstrap trust for config-declared peers ─────────────────────────
+    // Config peers are explicitly trusted: operator declared them.
+    for peer in &cfg.federation.peers {
+        trust.register_config_peer(
+            &peer.node_id,
+            &peer.public_key_hex,
+            &peer.url,
+            false,
+        ).await?;
+        info!("config peer trusted: {} ({})", &peer.node_id[..16.min(peer.node_id.len())], peer.url);
+    }
+
+    // ── CNC: register self as head node ───────────────────────────────────
+    if is_cnc {
+        trust.register_config_peer(
+            &identity.fingerprint,
+            &identity.public_key_hex,
+            &our_url,
+            true,
+        ).await?;
+        info!("registered self as head node");
+    }
+
+    // ── Client: register + trust the CNC if configured ───────────────────
+    let cnc_url_resolved = if !cfg.node.cnc_url.is_empty() {
+        Some(cfg.node.cnc_url.clone())
+    } else {
+        None
+    };
+
+    if let Some(ref cnc_url) = cnc_url_resolved {
+        if !cfg.node.cnc_node_id.is_empty() {
+            // Trust the CNC immediately — we know its fingerprint from config
+            trust.register_config_peer(
+                &cfg.node.cnc_node_id,
+                "",   // public key filled in on first announce from CNC
+                cnc_url,
+                true, // CNC is a head node
+            ).await?;
+            info!("CNC trusted: {} ({})", &cfg.node.cnc_node_id[..16.min(cfg.node.cnc_node_id.len())], cnc_url);
+        }
+    }
 
     info!("listening on {}:{}", cfg.server.host, cfg.server.port);
 
@@ -60,7 +211,7 @@ async fn main() -> Result<()> {
     let api_backend:   Arc<dyn ModelBackend> = anthropic.clone();
 
     // ── Federation ────────────────────────────────────────────────────────
-    let peers = peers_from_urls(&cfg.federation.peers);
+    let peers      = peers_from_config(&cfg.federation.peers);
     let federation = Arc::new(FederationClient::new(
         peers,
         cfg.federation.enabled,
@@ -77,7 +228,7 @@ async fn main() -> Result<()> {
         embedder,
         local_backend,
         api_backend,
-    );
+    ).with_federation(federation.clone());
 
     // ── Startup: pull revocations from known peers ────────────────────────
     {
@@ -89,11 +240,71 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ── Client bootstrap: announce to CNC ────────────────────────────────
+    if let Some(cnc_url) = cnc_url_resolved.clone() {
+        let identity_b = identity.clone();
+        let cache_b    = cache.clone();
+        let our_url_b  = our_url.clone();
+        tokio::spawn(async move {
+            // Small delay — let the server start binding before CNC tries to
+            // contact us back.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            let hashes = cache_b.list_shared_hashes(500, 0).await.unwrap_or_default();
+
+            // Attach any stored counter-signature from a previous CNC bootstrap
+            let (countersigned_by, counter_signature) = load_countersig("node_countersig.json");
+
+            let mut payload = AnnouncePayload::build(&identity_b, &our_url_b, hashes);
+            payload.countersigned_by  = countersigned_by;
+            payload.counter_signature = counter_signature;
+
+            let client = reqwest::Client::new();
+            match client
+                .post(format!("{cnc_url}/v1/federation/announce"))
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        // If the CNC returned a counter-signature, persist it so
+                        // future announces to other peers carry CNC endorsement.
+                        if let (Some(sig), Some(by)) = (
+                            body.get("counter_signature").and_then(|v| v.as_str()),
+                            body.get("counter_node_id").and_then(|v| v.as_str()),
+                        ) {
+                            save_countersig("node_countersig.json", by, sig);
+                            info!("received counter-signature from CNC {}", &by[..16.min(by.len())]);
+                        }
+                        info!("CNC bootstrap: {}", body.get("status").and_then(|v| v.as_str()).unwrap_or("ok"));
+                    }
+                }
+                Ok(resp) => {
+                    tracing::warn!("CNC bootstrap rejected: HTTP {}", resp.status());
+                }
+                Err(e) => {
+                    tracing::warn!("CNC bootstrap failed (server may not be up yet): {e}");
+                }
+            }
+        });
+    }
+
+    // ── Background: peer health checks ───────────────────────────────────
+    if cfg.health.enabled && cfg.federation.enabled {
+        let health_trust  = trust.clone();
+        let health_cfg    = cfg.health.clone();
+        let health_our_id = identity.fingerprint.clone();
+        tokio::spawn(async move {
+            health::run(health_trust, health_cfg, health_our_id).await;
+        });
+    }
+
     // ── Background: eviction + gossip + revocation sync ───────────────────
     {
         let evict_cache = cache.clone();
         let fed         = federation.clone();
-        let our_url     = format!("http://{}:{}", cfg.server.host, cfg.server.port);
+        let bg_url      = our_url.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
@@ -102,7 +313,7 @@ async fn main() -> Result<()> {
                     if n > 0 { info!("evicted {n} expired cache entries"); }
                 }
                 if let Ok(hashes) = evict_cache.list_shared_hashes(500, 0).await {
-                    fed.announce(hashes, &our_url).await;
+                    fed.announce(hashes, &bg_url).await;
                 }
                 let applied = fed.sync_revocations(&evict_cache).await;
                 if applied > 0 { info!("hourly sync: applied {applied} revocations from peers"); }
@@ -110,7 +321,17 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ── Portal token (env only — never in config.toml) ────────────────────
+    let portal_token = std::env::var("CLAUDE_CACHE_PORTAL_TOKEN").ok()
+        .filter(|t| !t.is_empty());
+    if portal_token.is_some() {
+        info!("portal auth: enabled (CLAUDE_CACHE_PORTAL_TOKEN is set)");
+    } else {
+        info!("portal auth: disabled (set CLAUDE_CACHE_PORTAL_TOKEN to enable)");
+    }
+
     // ── Server ────────────────────────────────────────────────────────────
+    let node_id = identity.fingerprint.clone();
     let state = Arc::new(AppState {
         router,
         cache,
@@ -119,9 +340,12 @@ async fn main() -> Result<()> {
         trust,
         identity,
         anthropic,
-        node_id:      cfg.server.node_id.clone(),
+        node_id,
+        is_cnc,
+        auto_promote_peers: cfg.node.auto_promote_peers,
         api_base_url: cfg.api.base_url.clone(),
         api_creds:    creds,
+        portal_token,
     });
 
     let app      = build_router(state);
@@ -129,8 +353,11 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     info!("dashboard:  http://{addr}");
-    info!("trust mgmt: POST http://{addr}/v1/trust/:node_id");
-    info!("evict:      POST http://{addr}/v1/evict/:node_id");
+    if is_cnc {
+        info!("CNC peers:  GET  http://{addr}/v1/federation/peers");
+        info!("CNC trust:  POST http://{addr}/v1/trust/:node_id");
+        info!("CNC evict:  POST http://{addr}/v1/evict/:node_id");
+    }
 
     axum::serve(listener, app).await?;
     Ok(())

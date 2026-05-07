@@ -44,6 +44,17 @@ pub struct CacheStats {
     pub db_size_bytes:  i64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoutingLogEntry {
+    pub shape_key:  String,
+    pub decision:   String,
+    pub backend:    String,
+    pub latency_ms: i64,
+    pub tokens_in:  Option<i64>,
+    pub saved_usd:  Option<f64>,
+    pub created_at: i64,
+}
+
 // ── Store ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -363,6 +374,84 @@ impl CacheStore {
             .execute(&self.pool)
             .await?;
         Ok(r.rows_affected())
+    }
+
+    /// Return the total accumulated hit_count for all live entries with this domain+intent.
+    /// Used by the router's novelty scoring to reduce novelty for familiar prompt shapes.
+    pub async fn domain_hit_count(&self, domain: &str, intent: &str) -> Result<i64> {
+        let now = Utc::now().timestamp();
+        let total: i64 = sqlx::query(
+            "SELECT COALESCE(SUM(hit_count), 0) AS total \
+             FROM cache_entries \
+             WHERE domain = ? AND intent = ? \
+               AND (expires_at IS NULL OR expires_at > ?)"
+        )
+        .bind(domain)
+        .bind(intent)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?
+        .get("total");
+        Ok(total)
+    }
+
+    /// Return the most recent routing log entries for the dashboard.
+    pub async fn routing_log_recent(&self, limit: i64) -> Result<Vec<RoutingLogEntry>> {
+        let rows = sqlx::query(
+            "SELECT shape_key, decision, backend, latency_ms, tokens_in, saved_usd, created_at
+             FROM routing_log ORDER BY created_at DESC LIMIT ?"
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| RoutingLogEntry {
+            shape_key:  r.get("shape_key"),
+            decision:   r.get("decision"),
+            backend:    r.get("backend"),
+            latency_ms: r.get("latency_ms"),
+            tokens_in:  r.get("tokens_in"),
+            saved_usd:  r.get("saved_usd"),
+            created_at: r.get("created_at"),
+        }).collect())
+    }
+
+    /// Aggregate routing decisions over the last `since_secs` seconds.
+    pub async fn routing_log_stats(&self, since_secs: i64) -> Result<serde_json::Value> {
+        use serde_json::json;
+        let since = Utc::now().timestamp() - since_secs;
+
+        let rows = sqlx::query(
+            "SELECT decision, COUNT(*) as cnt,
+                    AVG(CAST(latency_ms AS REAL)) as avg_lat,
+                    COALESCE(SUM(saved_usd), 0.0) as saved
+             FROM routing_log WHERE created_at >= ?
+             GROUP BY decision ORDER BY cnt DESC"
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let total: i64 = rows.iter().map(|r| r.get::<i64, _>("cnt")).sum();
+
+        let by_decision: Vec<serde_json::Value> = rows.iter().map(|r| {
+            let cnt: i64     = r.get("cnt");
+            let avg_lat: f64 = r.get("avg_lat");
+            let saved: f64   = r.get("saved");
+            json!({
+                "decision":       r.get::<String, _>("decision"),
+                "count":          cnt,
+                "pct":            if total > 0 { cnt as f64 / total as f64 * 100.0 } else { 0.0 },
+                "avg_latency_ms": avg_lat,
+                "saved_usd":      saved,
+            })
+        }).collect();
+
+        Ok(json!({
+            "total_requests": total,
+            "by_decision":    by_decision,
+            "window_hours":   since_secs / 3600,
+        }))
     }
 
     /// Evict expired entries.

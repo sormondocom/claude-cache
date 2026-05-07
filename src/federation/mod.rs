@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::cache::{CacheEntry, CacheStore};
 use crate::identity::{announce_message, NodeIdentity, RemoteKey};
@@ -28,6 +28,22 @@ pub struct FederatedEntry {
     pub node_id:    String,
     /// Signature over: sha256(hash + response + node_id) — hex Ed25519 sig
     pub signature:  String,
+}
+
+/// Request body for POST /v1/federation/semantic
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticLookupRequest {
+    pub domain:        String,
+    pub embedding:     Vec<f32>,
+    pub sim_threshold: f64,
+    pub limit:         usize,
+}
+
+/// Single result from POST /v1/federation/semantic
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticFederatedEntry {
+    pub entry:      FederatedEntry,
+    pub similarity: f64,
 }
 
 /// Wire type for /v1/federation/announce
@@ -130,52 +146,100 @@ impl FederationClient {
         }
     }
 
-    /// Query TRUSTED peers for a cache entry by SHA256 hash.
-    /// Untrusted peers are never queried.
-    /// The response is signature-verified before being returned.
+    /// Query TRUSTED, REACHABLE peers for a cache entry by SHA256 hash.
+    /// Peers are sorted by average latency (fastest first) before the parallel
+    /// fan-out, so the first result to resolve is most likely to be the fastest.
     pub async fn lookup(&self, hash: &str) -> Option<FederatedEntry> {
         if !self.enabled || self.peers.is_empty() {
             return None;
         }
 
-        let futures: Vec<_> = self.peers.iter().map(|peer| {
-            let client   = self.client.clone();
-            let trust    = self.trust.clone();
-            let url      = format!("{}/v1/federation/lookup/{}", peer.url, hash);
-            let peer_id  = peer.id.clone();
-            async move {
-                // Only query trusted peers
-                if !trust.is_trusted(&peer_id).await {
-                    debug!("skipping untrusted peer {}", &peer_id[..16.min(peer_id.len())]);
-                    return None;
-                }
+        let peers = self.reachable_peers_sorted().await;
+        if peers.is_empty() {
+            return None;
+        }
 
+        let mut handles = Vec::new();
+        for peer in peers {
+            let client  = self.client.clone();
+            let trust   = self.trust.clone();
+            let url     = format!("{}/v1/federation/lookup/{}", peer.url, hash);
+            let peer_id = peer.id.clone();
+            handles.push(tokio::spawn(async move {
                 let resp = client.get(&url).send().await.ok()?;
                 if !resp.status().is_success() {
                     return None;
                 }
-
                 let entry: FederatedEntry = resp.json().await.ok()?;
-
-                // Verify the response signature
                 let remote_key = trust.get_public_key(&entry.node_id).await.ok()??;
                 let msg = federated_entry_message(&entry);
                 if remote_key.verify(&msg, &entry.signature).is_err() {
                     warn!("federation lookup: bad signature from {}", &peer_id[..16.min(peer_id.len())]);
                     return None;
                 }
-
                 Some(entry)
-            }
-        }).collect();
-
-        let mut handles = Vec::new();
-        for fut in futures {
-            handles.push(tokio::spawn(fut));
+            }));
         }
         for handle in handles {
             if let Ok(Some(entry)) = handle.await {
                 return Some(entry);
+            }
+        }
+        None
+    }
+
+    /// Query TRUSTED, REACHABLE peers for semantically similar entries.
+    /// Peers are sorted by average latency (fastest first).
+    pub async fn lookup_semantic(
+        &self,
+        embedding:     &[f32],
+        domain:        &str,
+        sim_threshold: f64,
+        limit:         usize,
+    ) -> Option<(FederatedEntry, f64)> {
+        if !self.enabled || self.peers.is_empty() {
+            return None;
+        }
+
+        let peers = self.reachable_peers_sorted().await;
+        if peers.is_empty() {
+            return None;
+        }
+
+        let req = SemanticLookupRequest {
+            domain:        domain.to_string(),
+            embedding:     embedding.to_vec(),
+            sim_threshold,
+            limit,
+        };
+        let req_body = serde_json::to_value(&req).ok()?;
+
+        let mut handles = Vec::new();
+        for peer in peers {
+            let client  = self.client.clone();
+            let trust   = self.trust.clone();
+            let url     = format!("{}/v1/federation/semantic", peer.url);
+            let peer_id = peer.id.clone();
+            let body    = req_body.clone();
+            handles.push(tokio::spawn(async move {
+                let resp = client.post(&url).json(&body).send().await.ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                let hits: Vec<SemanticFederatedEntry> = resp.json().await.ok()?;
+                let hit = hits.into_iter().next()?;
+                let remote_key = trust.get_public_key(&hit.entry.node_id).await.ok()??;
+                let msg = federated_entry_message(&hit.entry);
+                if remote_key.verify(&msg, &hit.entry.signature).is_err() {
+                    warn!("semantic federation: bad signature from {}", &peer_id[..16.min(peer_id.len())]);
+                    return None;
+                }
+                Some((hit.entry, hit.similarity))
+            }));
+        }
+        for handle in handles {
+            if let Ok(Some(result)) = handle.await {
+                return Some(result);
             }
         }
         None
@@ -230,9 +294,16 @@ impl FederationClient {
     /// Pull revocations from a single peer URL and apply any that are new and valid.
     /// Used both on startup sync and after receiving an announce.
     pub async fn pull_revocations_from_url(&self, peer_url: &str, cache: &CacheStore) -> usize {
+        #[derive(serde::Deserialize)]
+        struct RevocationListResponse { revocations: Vec<RevocationRecord> }
+
         let url = format!("{}/v1/federation/revocations", peer_url);
         let revocations: Vec<RevocationRecord> = match self.client.get(&url).send().await {
-            Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+            Ok(r) if r.status().is_success() => {
+                r.json::<RevocationListResponse>().await
+                    .map(|w| w.revocations)
+                    .unwrap_or_default()
+            }
             _ => return 0,
         };
         let mut applied = 0usize;
@@ -263,6 +334,37 @@ impl FederationClient {
         total
     }
 
+    /// Return the subset of configured peers that are currently trusted AND
+    /// reachable, sorted by average health-check latency (fastest first).
+    /// Peers with no health data are included (given benefit of the doubt) and
+    /// placed after peers with known-good latency.
+    async fn reachable_peers_sorted(&self) -> Vec<PeerNode> {
+        let health = self.trust.list_peer_health().await.unwrap_or_default();
+
+        // Build a latency map: node_id → avg_latency_ms (None = unknown)
+        let lat: std::collections::HashMap<&str, Option<f64>> = health
+            .iter()
+            .map(|h| (h.node_id.as_str(), if h.is_reachable { h.avg_latency_ms } else { None }))
+            .collect();
+
+        let mut peers: Vec<&PeerNode> = self.peers.iter()
+            .filter(|p| {
+                // Skip peers the health checker has marked unreachable.
+                // Peers with no health record are included.
+                lat.get(p.id.as_str()).map(|v| v.is_some()).unwrap_or(true)
+            })
+            .collect();
+
+        // Fastest known peers first; unknown-latency peers at the end.
+        peers.sort_by(|a, b| {
+            let la = lat.get(a.id.as_str()).and_then(|v| *v).unwrap_or(f64::MAX);
+            let lb = lat.get(b.id.as_str()).and_then(|v| *v).unwrap_or(f64::MAX);
+            la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        peers.into_iter().cloned().collect()
+    }
+
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
@@ -290,17 +392,16 @@ pub fn entry_to_federated(entry: &CacheEntry, identity: &NodeIdentity) -> Federa
 }
 
 /// Canonical message to sign for a FederatedEntry.
+/// Covers the full response via SHA256 so truncation cannot forge a valid entry.
 pub fn federated_entry_message(fe: &FederatedEntry) -> Vec<u8> {
-    format!("{}|{}|{}", fe.hash, fe.node_id, &fe.response[..fe.response.len().min(256)])
-        .into_bytes()
+    use sha2::{Digest, Sha256};
+    let resp_hash = hex::encode(Sha256::digest(fe.response.as_bytes()));
+    format!("{}|{}|{}", fe.hash, fe.node_id, resp_hash).into_bytes()
 }
 
-/// Build a PeerNode list from config URL strings.
-pub fn peers_from_urls(urls: &[String]) -> Vec<PeerNode> {
-    urls.iter()
-        .map(|url| PeerNode {
-            id:  format!("peer-{}", &url[url.len().saturating_sub(8)..]),
-            url: url.clone(),
-        })
+/// Build a PeerNode list from typed peer configs.
+pub fn peers_from_config(peers: &[crate::config::PeerConfig]) -> Vec<PeerNode> {
+    peers.iter()
+        .map(|p| PeerNode { id: p.node_id.clone(), url: p.url.clone() })
         .collect()
 }

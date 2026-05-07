@@ -2,6 +2,7 @@ use axum::{
     body::Body,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router as AxumRouter,
@@ -16,7 +17,8 @@ use tracing::{info, warn};
 use crate::backend::{MessagesRequest, MessagesResponse};
 use crate::budget::BudgetLedger;
 use crate::cache::CacheStore;
-use crate::federation::{entry_to_federated, AnnouncePayload, FederationClient};
+use crate::federation::{entry_to_federated, AnnouncePayload, FederationClient, SemanticFederatedEntry, SemanticLookupRequest};
+use crate::identity::announce_message;
 use crate::identity::NodeIdentity;
 use crate::router::{RouteDecision, Router};
 use crate::trust::TrustStore;
@@ -32,41 +34,81 @@ pub struct AppState {
     pub trust:       Arc<TrustStore>,
     pub identity:    Arc<NodeIdentity>,
     pub anthropic:   Arc<AnthropicBackend>,
-    pub node_id:     String,
-    pub api_base_url: String,
-    pub api_creds:   crate::auth::Credentials,
+    /// Ed25519 fingerprint — the canonical node identity used everywhere.
+    pub node_id:          String,
+    pub is_cnc:           bool,
+    pub auto_promote_peers: bool,
+    pub api_base_url:     String,
+    pub api_creds:        crate::auth::Credentials,
+    /// Static bearer token for the management portal.  `None` = auth disabled.
+    /// Set via `CLAUDE_CACHE_PORTAL_TOKEN` env var — never stored in config files.
+    pub portal_token:     Option<String>,
 }
 
 pub type SharedState = Arc<AppState>;
 
+// ── Portal auth middleware ─────────────────────────────────────────────────
+
+async fn require_portal_token(
+    State(state): State<SharedState>,
+    request:      axum::extract::Request,
+    next:         middleware::Next,
+) -> Response {
+    if let Some(token) = &state.portal_token {
+        let ok = request
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|t| t == token.as_str())
+            .unwrap_or(false);
+
+        if !ok {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [("www-authenticate", "Bearer realm=\"claude-cache\"")],
+                Json(json!({"error": "unauthorized"})),
+            ).into_response();
+        }
+    }
+    next.run(request).await
+}
+
 // ── Routes ─────────────────────────────────────────────────────────────────
 
 pub fn build_router(state: SharedState) -> AxumRouter {
-    AxumRouter::new()
-        // Primary proxy endpoint
-        .route("/v1/messages", post(handle_messages))
-        // Health + stats
-        .route("/health",      get(handle_health))
-        .route("/stats",       get(handle_stats))
-        // Budget control
-        .route("/api/pricing", post(handle_update_pricing))
-        .route("/api/spend",   get(handle_spend))
-        // Federation endpoints
-        .route("/v1/federation/lookup/:hash",  get(handle_federation_lookup))
-        .route("/v1/federation/announce",      post(handle_federation_announce))
-        .route("/v1/federation/peers",         get(handle_federation_peers))
-        .route("/v1/federation/revocations",   get(handle_get_revocations)
-                                               .post(handle_receive_revocation))
-        // Trust management
-        .route("/v1/trust",                   get(handle_trust_list))
-        .route("/v1/trust/:node_id",          post(handle_trust_promote))
-        .route("/v1/evict/:node_id",          post(handle_evict))
-        // Dashboard
-        .route("/",            get(crate::portal::handle_dashboard))
+    // Protected routes require a portal token when one is configured.
+    let protected = AxumRouter::new()
+        .route("/stats",        get(handle_stats))
+        .route("/api/pricing",  post(handle_update_pricing))
+        .route("/api/spend",    get(handle_spend))
+        .route("/v1/trust",              get(handle_trust_list))
+        .route("/v1/trust/:node_id",     post(handle_trust_promote))
+        .route("/v1/evict/:node_id",     post(handle_evict))
+        .route("/",             get(crate::portal::handle_dashboard))
         .route("/api/overview", get(crate::portal::handle_overview))
-        .route("/api/cache",   get(crate::portal::handle_cache_entries))
-        // Passthrough for any other /v1/* paths
-        .fallback(handle_passthrough)
+        .route("/api/cache",    get(crate::portal::handle_cache_entries))
+        .route("/api/trust",        get(crate::portal::handle_trust_nodes))
+        .route("/api/peers/health", get(crate::portal::handle_peer_health))
+        .route("/api/routing",      get(crate::portal::handle_routing_log))
+        .layer(middleware::from_fn_with_state(state.clone(), require_portal_token));
+
+    // Public routes: the proxy endpoint, health check, and federation peer
+    // endpoints (which have their own Ed25519-based authentication).
+    let public = AxumRouter::new()
+        .route("/v1/messages",               post(handle_messages))
+        .route("/health",                    get(handle_health))
+        .route("/v1/federation/lookup/:hash", get(handle_federation_lookup))
+        .route("/v1/federation/announce",    post(handle_federation_announce))
+        .route("/v1/federation/peers",       get(handle_federation_peers))
+        .route("/v1/federation/semantic",    post(handle_federation_semantic))
+        .route("/v1/federation/revocations", get(handle_get_revocations)
+                                             .post(handle_receive_revocation))
+        .fallback(handle_passthrough);
+
+    AxumRouter::new()
+        .merge(public)
+        .merge(protected)
         .with_state(state)
 }
 
@@ -132,17 +174,14 @@ async fn handle_stream_messages(state: SharedState, req: MessagesRequest) -> Res
     // True streaming passthrough to Anthropic
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let anthropic = state.anthropic.clone();
+    let router    = state.router.clone();
     let req_clone = req.clone();
 
     tokio::spawn(async move {
         match anthropic.stream_to_channel(&req_clone, tx.clone()).await {
             Ok(acc) => {
-                // Background: cache the accumulated response
-                // (fire-and-forget, don't block the stream)
-                info!(
-                    "stream complete: {} output tokens accumulated",
-                    acc.output_tokens
-                );
+                info!("stream complete: {} output tokens accumulated", acc.output_tokens);
+                router.cache_streamed(&req_clone, &acc.text, &acc.message_id, acc.input_tokens, acc.output_tokens).await;
             }
             Err(e) => warn!("stream error: {e}"),
         }
@@ -321,7 +360,17 @@ async fn handle_federation_announce(
         }
     }
 
-    // 5. Untrusted nodes are acknowledged but their hashes are ignored
+    // 5a. CNC auto-promote: if we're a CNC configured to auto-promote, trust the
+    //     node immediately so it gets a counter-signature in the response below.
+    let trust_state = if state.is_cnc && state.auto_promote_peers && !trust_state.is_trusted() {
+        info!("CNC auto-promoting {}", &payload.node_id[..16]);
+        let _ = state.trust.promote(&payload.node_id, &state.node_id, false).await;
+        state.trust.get_state(&payload.node_id).await.unwrap_or(trust_state)
+    } else {
+        trust_state
+    };
+
+    // 5b. Untrusted nodes are acknowledged but their hashes are ignored
     if !trust_state.is_trusted() {
         info!(
             "federation announce from untrusted node {} ({} hashes ignored)",
@@ -349,16 +398,63 @@ async fn handle_federation_announce(
         });
     }
 
+    // If we are a CNC (head node), return a counter-signature so the client
+    // can carry our endorsement to other peers for automatic promotion.
+    if state.is_cnc {
+        let counter_msg = announce_message(
+            &payload.node_id,
+            &payload.url,
+            &payload.public_key_hex,
+            &[],
+        );
+        let counter_sig = state.identity.sign(&counter_msg);
+        return Json(json!({
+            "ok":              true,
+            "status":          "trusted",
+            "received":        payload.hashes.len(),
+            "counter_signature": counter_sig,
+            "counter_node_id": state.identity.fingerprint,
+        })).into_response();
+    }
+
     Json(json!({ "ok": true, "status": "trusted", "received": payload.hashes.len() })).into_response()
+}
+
+async fn handle_federation_semantic(
+    State(state): State<SharedState>,
+    Json(req):    Json<SemanticLookupRequest>,
+) -> Response {
+    match state.cache.lookup_semantic(
+        &req.domain,
+        &req.embedding,
+        req.sim_threshold,
+        req.limit.min(10), // cap peer results at 10 to limit response size
+    ).await {
+        Ok(hits) => {
+            let entries: Vec<SemanticFederatedEntry> = hits
+                .into_iter()
+                .map(|(entry, sim)| SemanticFederatedEntry {
+                    entry:      entry_to_federated(&entry, &state.identity),
+                    similarity: sim,
+                })
+                .collect();
+            Json(entries).into_response()
+        }
+        Err(e) => {
+            warn!("federation semantic lookup error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
+        }
+    }
 }
 
 async fn handle_federation_peers(State(state): State<SharedState>) -> Json<Value> {
     let trusted = state.trust.list_trusted().await.unwrap_or_default();
     Json(json!({
-        "node_id":      state.node_id,
-        "public_key":   state.identity.public_key_hex,
-        "peer_count":   state.federation.peer_count(),
-        "enabled":      state.federation.is_enabled(),
+        "node_id":       state.identity.fingerprint,
+        "public_key":    state.identity.public_key_hex,
+        "is_cnc":        state.is_cnc,
+        "peer_count":    state.federation.peer_count(),
+        "enabled":       state.federation.is_enabled(),
         "trusted_peers": trusted.len(),
     }))
 }

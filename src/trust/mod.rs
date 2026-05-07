@@ -24,6 +24,23 @@ use tracing::{info, warn};
 use crate::cache::CacheStore;
 use crate::identity::RemoteKey;
 
+// ── Health types ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct PeerHealth {
+    pub node_id:          String,
+    pub url:              String,
+    pub is_reachable:     bool,
+    /// Latency of the most recent successful check (ms).
+    pub latency_ms:       Option<i64>,
+    /// Exponential moving average latency across all successful checks (ms).
+    pub avg_latency_ms:   Option<f64>,
+    pub last_checked:     Option<i64>,
+    pub last_success:     Option<i64>,
+    pub consecutive_fail: u32,
+    pub check_count:      i64,
+}
+
 // ── State types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -120,6 +137,21 @@ impl TrustStore {
             )
         "#).execute(&self.pool).await?;
 
+        sqlx::query(r#"
+            CREATE TABLE IF NOT EXISTS peer_health (
+                node_id          TEXT    PRIMARY KEY,
+                url              TEXT    NOT NULL DEFAULT '',
+                is_reachable     INTEGER NOT NULL DEFAULT 1,
+                latency_ms       INTEGER,
+                avg_latency_ms   REAL,
+                last_checked     INTEGER,
+                last_success     INTEGER,
+                consecutive_fail INTEGER NOT NULL DEFAULT 0,
+                consecutive_ok   INTEGER NOT NULL DEFAULT 0,
+                check_count      INTEGER NOT NULL DEFAULT 0
+            )
+        "#).execute(&self.pool).await?;
+
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_trust_state ON node_records(trust_state)")
             .execute(&self.pool).await?;
 
@@ -139,8 +171,11 @@ impl TrustStore {
             INSERT INTO node_records (node_id, public_key_hex, url, trust_state, first_seen, last_seen)
             VALUES (?, ?, ?, 'untrusted', ?, ?)
             ON CONFLICT(node_id) DO UPDATE SET
-                url       = excluded.url,
-                last_seen = excluded.last_seen
+                url            = excluded.url,
+                public_key_hex = CASE WHEN node_records.public_key_hex = ''
+                                      THEN excluded.public_key_hex
+                                      ELSE node_records.public_key_hex END,
+                last_seen      = excluded.last_seen
         "#)
         .bind(node_id)
         .bind(public_key_hex)
@@ -151,6 +186,42 @@ impl TrustStore {
         .await?;
 
         self.get_state(node_id).await
+    }
+
+    /// Register a peer that was declared in config and auto-trust it.
+    /// Config-specified peers are explicitly trusted by the operator — this is
+    /// the equivalent of SSH known_hosts.  If the peer record already exists and
+    /// is trusted/evicted, the trust state is not downgraded.
+    pub async fn register_config_peer(
+        &self,
+        node_id:        &str,
+        public_key_hex: &str,
+        url:            &str,
+        is_head:        bool,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query(r#"
+            INSERT INTO node_records
+                (node_id, public_key_hex, url, is_head, trust_state, signed_by, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, 'trusted', 'config', ?, ?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                url            = excluded.url,
+                is_head        = excluded.is_head,
+                public_key_hex = CASE WHEN node_records.public_key_hex = ''
+                                      THEN excluded.public_key_hex
+                                      ELSE node_records.public_key_hex END,
+                last_seen      = excluded.last_seen
+        "#)
+        .bind(node_id)
+        .bind(public_key_hex)
+        .bind(url)
+        .bind(is_head as i32)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        self.log_event(node_id, "config-trusted", "config", None).await;
+        Ok(())
     }
 
     // ── Queries ─────────────────────────────────────────────────────────────
@@ -396,6 +467,111 @@ impl TrustStore {
             signature:  r.get("signature"),
             revoked_at: r.get("revoked_at"),
         }).collect())
+    }
+
+    // ── Peer health ─────────────────────────────────────────────────────────
+
+    /// Record the outcome of a health check probe to a peer node.
+    /// Uses an exponential moving average (α=0.2) for latency smoothing.
+    /// A peer becomes unreachable after `failure_threshold` consecutive failures.
+    pub async fn record_health_check(
+        &self,
+        node_id:           &str,
+        url:               &str,
+        success:           bool,
+        latency_ms:        Option<u64>,
+        failure_threshold: u32,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        let lat = latency_ms.map(|l| l as i64);
+        let success_i = if success { 1i32 } else { 0i32 };
+
+        // initial_is_reachable is only used for brand-new INSERT rows.
+        // The ON CONFLICT UPDATE branch uses success_i (?3) directly.
+        let initial_is_reachable = if success { 1i32 } else if failure_threshold <= 1 { 0i32 } else { 1i32 };
+        let initial_cons_fail    = if success { 0i32 } else { 1i32 };
+        let initial_cons_ok      = if success { 1i32 } else { 0i32 };
+
+        sqlx::query(
+            "INSERT INTO peer_health
+                (node_id, url, is_reachable, latency_ms, avg_latency_ms,
+                 last_checked, last_success, consecutive_fail, consecutive_ok, check_count)
+             VALUES (?1, ?2, ?10, ?4, ?4, ?5, ?6, ?7, ?8, 1)
+             ON CONFLICT(node_id) DO UPDATE SET
+                url             = ?2,
+                latency_ms      = ?4,
+                avg_latency_ms  = CASE
+                    WHEN ?4 IS NOT NULL AND avg_latency_ms IS NOT NULL
+                         THEN avg_latency_ms * 0.8 + CAST(?4 AS REAL) * 0.2
+                    WHEN ?4 IS NOT NULL THEN CAST(?4 AS REAL)
+                    ELSE avg_latency_ms
+                END,
+                last_checked    = ?5,
+                last_success    = CASE WHEN ?3 = 1 THEN ?5 ELSE last_success END,
+                consecutive_fail = CASE WHEN ?3 = 0 THEN consecutive_fail + 1 ELSE 0 END,
+                consecutive_ok  = CASE WHEN ?3 = 1 THEN consecutive_ok  + 1 ELSE 0 END,
+                check_count     = check_count + 1,
+                is_reachable    = CASE
+                    WHEN ?3 = 1 THEN 1
+                    WHEN consecutive_fail + 1 >= ?9 THEN 0
+                    ELSE is_reachable
+                END"
+        )
+        .bind(node_id)                  // ?1
+        .bind(url)                      // ?2
+        .bind(success_i)                // ?3 — actual success flag for UPDATE CASE expressions
+        .bind(lat)                      // ?4
+        .bind(now)                      // ?5
+        .bind(if success { Some(now) } else { None::<i64> })  // ?6 last_success for INSERT
+        .bind(initial_cons_fail)        // ?7
+        .bind(initial_cons_ok)          // ?8
+        .bind(failure_threshold as i64) // ?9
+        .bind(initial_is_reachable)     // ?10 — initial is_reachable for INSERT only
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Returns health records for all known peers, ordered by average latency
+    /// (fastest first, unknowns last).
+    pub async fn list_peer_health(&self) -> Result<Vec<PeerHealth>> {
+        let rows = sqlx::query(
+            "SELECT node_id, url, is_reachable, latency_ms, avg_latency_ms,
+                    last_checked, last_success, consecutive_fail, check_count
+             FROM peer_health
+             ORDER BY CASE WHEN avg_latency_ms IS NULL THEN 1 ELSE 0 END,
+                      avg_latency_ms ASC"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| PeerHealth {
+            node_id:          r.get("node_id"),
+            url:              r.get("url"),
+            is_reachable:     r.get::<i32, _>("is_reachable") != 0,
+            latency_ms:       r.get("latency_ms"),
+            avg_latency_ms:   r.get("avg_latency_ms"),
+            last_checked:     r.get("last_checked"),
+            last_success:     r.get("last_success"),
+            consecutive_fail: r.get::<i32, _>("consecutive_fail") as u32,
+            check_count:      r.get("check_count"),
+        }).collect())
+    }
+
+    /// Quick check used by the federation client before attempting a peer lookup.
+    /// Returns `true` if the peer has no health record yet (give benefit of the doubt)
+    /// or if its last recorded state was reachable.
+    pub async fn is_peer_reachable(&self, node_id: &str) -> bool {
+        let row = sqlx::query("SELECT is_reachable FROM peer_health WHERE node_id = ?")
+            .bind(node_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+        match row {
+            Some(r) => r.get::<i32, _>("is_reachable") != 0,
+            None    => true, // no data yet — assume reachable
+        }
     }
 
     async fn log_event(&self, node_id: &str, event: &str, actor: &str, reason: Option<&str>) {

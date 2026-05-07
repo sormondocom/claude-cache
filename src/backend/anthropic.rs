@@ -96,6 +96,8 @@ use tokio::sync::mpsc;
 
 pub struct StreamAccumulator {
     pub text:         String,
+    /// Real Anthropic message ID from the `message_start` SSE event (e.g. "msg_01abc…").
+    pub message_id:   String,
     pub input_tokens: u32,
     pub output_tokens: u32,
 }
@@ -131,7 +133,8 @@ impl AnthropicBackend {
         let mut stream = resp.bytes_stream();
         let mut acc = StreamAccumulator {
             text:          String::new(),
-            input_tokens:  req.estimated_input_tokens(),
+            message_id:    String::new(),
+            input_tokens:  req.estimated_input_tokens(), // overwritten by message_start event
             output_tokens: 0,
         };
 
@@ -151,18 +154,30 @@ impl StreamAccumulator {
             for line in text.lines() {
                 if let Some(data) = line.strip_prefix("data: ") {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                        // content_block_delta events carry text
-                        if v["type"] == "content_block_delta" {
-                            if let Some(t) = v["delta"]["text"].as_str() {
-                                self.text.push_str(t);
-                                self.output_tokens += (t.len() as u32) / 4;
+                        match v["type"].as_str() {
+                            // message_start: real message ID + actual input token count
+                            Some("message_start") => {
+                                if let Some(id) = v["message"]["id"].as_str() {
+                                    self.message_id = id.to_string();
+                                }
+                                if let Some(n) = v["message"]["usage"]["input_tokens"].as_u64() {
+                                    self.input_tokens = n as u32;
+                                }
                             }
-                        }
-                        // message_delta carries final usage
-                        if v["type"] == "message_delta" {
-                            if let Some(u) = v["usage"]["output_tokens"].as_u64() {
-                                self.output_tokens = u as u32;
+                            // content_block_delta: accumulate text
+                            Some("content_block_delta") => {
+                                if let Some(t) = v["delta"]["text"].as_str() {
+                                    self.text.push_str(t);
+                                    self.output_tokens += (t.len() as u32) / 4;
+                                }
                             }
+                            // message_delta: replace running estimate with final output count
+                            Some("message_delta") => {
+                                if let Some(u) = v["usage"]["output_tokens"].as_u64() {
+                                    self.output_tokens = u as u32;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }

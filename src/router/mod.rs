@@ -9,6 +9,7 @@ use crate::cache::CacheStore;
 use crate::config::AppConfig;
 use crate::domain;
 use crate::embedding::Embedder;
+use crate::federation::FederationClient;
 use crate::policy;
 use crate::scoring;
 
@@ -41,13 +42,15 @@ pub struct RoutedResponse {
     pub saved_usd:  f64,
 }
 
+#[derive(Clone)]
 pub struct Router {
-    cfg:      Arc<AppConfig>,
-    cache:    Arc<CacheStore>,
-    budget:   Arc<BudgetLedger>,
-    embedder: Arc<dyn Embedder>,
-    local:    Arc<dyn ModelBackend>,
-    api:      Arc<dyn ModelBackend>,
+    cfg:        Arc<AppConfig>,
+    cache:      Arc<CacheStore>,
+    budget:     Arc<BudgetLedger>,
+    embedder:   Arc<dyn Embedder>,
+    local:      Arc<dyn ModelBackend>,
+    api:        Arc<dyn ModelBackend>,
+    federation: Option<Arc<FederationClient>>,
 }
 
 impl Router {
@@ -59,7 +62,13 @@ impl Router {
         local:    Arc<dyn ModelBackend>,
         api:      Arc<dyn ModelBackend>,
     ) -> Self {
-        Router { cfg, cache, budget, embedder, local, api }
+        Router { cfg, cache, budget, embedder, local, api, federation: None }
+    }
+
+    /// Attach a federation client.  Call after `new()` before first use.
+    pub fn with_federation(mut self, fed: Arc<FederationClient>) -> Self {
+        self.federation = Some(fed);
+        self
     }
 
     pub async fn route(&self, req: &MessagesRequest) -> Result<RoutedResponse> {
@@ -99,46 +108,101 @@ impl Router {
             });
         }
 
-        // ── Step 4: Semantic cache ────────────────────────────────────────
-        let semantic_sim = if self.cfg.embedding.enabled {
+        // ── Step 3.5: Federation exact lookup ─────────────────────────────
+        // Ask trusted peers if they have the exact same prompt hash.
+        if let Some(ref fed) = self.federation {
+            let hash = CacheStore::content_key(&prompt);
+            if let Some(fed_entry) = fed.lookup(&hash).await {
+                info!("federation exact hit from {}", &fed_entry.node_id[..16.min(fed_entry.node_id.len())]);
+                let resp: MessagesResponse = serde_json::from_str(&fed_entry.response)?;
+                let latency_ms = start.elapsed().as_millis() as u64;
+                let saved = estimate_api_cost(&self.budget, req).await;
+                let pol = policy::infer(&shape, &prompt, &self.cfg);
+                if pol.should_cache() {
+                    let _ = self.cache.store(&shape, &prompt, &fed_entry.response,
+                        "federated", None, pol.ttl_secs, false).await;
+                }
+                let node_id = fed_entry.node_id.clone();
+                self.log(&shape, RouteDecision::FederationPeer(node_id.clone()), "federation", latency_ms, req, saved).await;
+                return Ok(RoutedResponse {
+                    response: resp,
+                    decision: RouteDecision::FederationPeer(node_id),
+                    latency_ms,
+                    saved_usd: saved,
+                });
+            }
+        }
+
+        // ── Step 4: Embedding (computed once, used for local + federation) ─
+        let embedding = if self.cfg.embedding.enabled {
             match self.embedder.embed(&prompt).await {
-                Ok(emb) => {
-                    let hits = self.cache.lookup_semantic(
-                        &shape.domain,
-                        &emb,
-                        self.cfg.embedding.sim_threshold,
-                        1,
-                    ).await?;
-                    if let Some((entry, sim)) = hits.into_iter().next() {
-                        info!("semantic cache hit (sim={sim:.3}): {}", &entry.id[..8]);
-                        let resp = serde_json::from_str(&entry.response)?;
-                        let latency_ms = start.elapsed().as_millis() as u64;
-                        let saved = estimate_api_cost(&self.budget, req).await;
-                        self.log(&shape, RouteDecision::SemanticCache, "cache", latency_ms, req, saved).await;
-                        return Ok(RoutedResponse {
-                            response: resp,
-                            decision: RouteDecision::SemanticCache,
-                            latency_ms,
-                            saved_usd: saved,
-                        });
-                    }
-                    None
-                }
-                Err(e) => {
-                    warn!("embedding failed, skipping semantic cache: {e}");
-                    None
-                }
+                Ok(emb) => Some(emb),
+                Err(e)  => { warn!("embedding failed, skipping semantic lookups: {e}"); None }
             }
         } else {
             None
         };
 
+        // ── Step 4a: Local semantic cache ─────────────────────────────────
+        if let Some(ref emb) = embedding {
+            let hits = self.cache.lookup_semantic(
+                &shape.domain, emb, self.cfg.embedding.sim_threshold, 1,
+            ).await?;
+            if let Some((entry, sim)) = hits.into_iter().next() {
+                info!("semantic cache hit (sim={sim:.3}): {}", &entry.id[..8]);
+                let resp = serde_json::from_str(&entry.response)?;
+                let latency_ms = start.elapsed().as_millis() as u64;
+                let saved = estimate_api_cost(&self.budget, req).await;
+                self.log(&shape, RouteDecision::SemanticCache, "cache", latency_ms, req, saved).await;
+                return Ok(RoutedResponse {
+                    response: resp,
+                    decision: RouteDecision::SemanticCache,
+                    latency_ms,
+                    saved_usd: saved,
+                });
+            }
+        }
+
+        // ── Step 4b: Federation semantic lookup ───────────────────────────
+        // Ask trusted peers for semantically similar entries using our embedding.
+        if let (Some(ref fed), Some(ref emb)) = (&self.federation, &embedding) {
+            if let Some((fed_entry, sim)) = fed.lookup_semantic(
+                emb, &shape.domain, self.cfg.embedding.sim_threshold, 1,
+            ).await {
+                info!("federation semantic hit (sim={sim:.3}) from {}",
+                    &fed_entry.node_id[..16.min(fed_entry.node_id.len())]);
+                let resp: MessagesResponse = serde_json::from_str(&fed_entry.response)?;
+                let latency_ms = start.elapsed().as_millis() as u64;
+                let saved = estimate_api_cost(&self.budget, req).await;
+                // Cache locally so future identical prompts skip the peer call.
+                let pol = policy::infer(&shape, &prompt, &self.cfg);
+                if pol.should_cache() {
+                    if let Ok(cid) = self.cache.store(&shape, &prompt, &fed_entry.response,
+                            "federated", None, pol.ttl_secs, false).await {
+                        if let Some(ref emb2) = embedding {
+                            let _ = self.cache.store_embedding(&cid, emb2, self.embedder.model()).await;
+                        }
+                    }
+                }
+                let node_id = fed_entry.node_id.clone();
+                self.log(&shape, RouteDecision::FederationPeer(node_id.clone()), "federation", latency_ms, req, saved).await;
+                return Ok(RoutedResponse {
+                    response: resp,
+                    decision: RouteDecision::FederationPeer(node_id),
+                    latency_ms,
+                    saved_usd: saved,
+                });
+            }
+        }
+
+        // semantic_sim is always None here (hits would have returned early above)
+        let semantic_sim: Option<f64> = None;
+
         // ── Step 5: Routing gate ──────────────────────────────────────────
-        // How many times have we seen this shape before?
-        let hit_count = {
-            // Re-use the exact-miss result — 0 since step 3 found nothing
-            0i64
-        };
+        // How familiar are we with this domain+intent shape?
+        let hit_count = self.cache.domain_hit_count(&shape.domain, &shape.intent)
+            .await
+            .unwrap_or(0);
         let score = scoring::score_prompt(&shape, &prompt, hit_count, semantic_sim);
         debug!("routing score: {}", score.display());
 
@@ -149,24 +213,30 @@ impl Router {
         }
 
         // ── Step 6: Budget gate ───────────────────────────────────────────
-        match self.budget.check().await? {
-            crate::budget::BudgetStatus::Exceeded { spent_usd, limit_usd } => {
-                warn!("budget exceeded (${spent_usd:.4} / ${limit_usd:.4}) → force local");
-                // fall through to local
-            }
-            _ => {}
+        let budget_exceeded = self.budget.check().await?.is_exceeded();
+        if budget_exceeded {
+            warn!("budget exceeded → local-only mode, API calls blocked");
         }
 
         // ── Step 7: Local model ───────────────────────────────────────────
         if self.cfg.local.enabled {
             match self.try_local(req, &shape, &pol, start).await {
                 Ok(Some(routed)) => return Ok(routed),
-                Ok(None)         => debug!("local model confidence too low → api"),
-                Err(e)           => warn!("local model error (escalating to api): {e}"),
+                Ok(None) if budget_exceeded => {
+                    anyhow::bail!("daily budget exceeded and local model confidence below floor");
+                }
+                Ok(None) => debug!("local model confidence too low → api"),
+                Err(e) if budget_exceeded => {
+                    anyhow::bail!("daily budget exceeded and local model unavailable: {e}");
+                }
+                Err(e) => warn!("local model error (escalating to api): {e}"),
             }
+        } else if budget_exceeded {
+            anyhow::bail!("daily budget exceeded and local model disabled");
         }
 
         // ── Step 8: Anthropic API (last resort) ───────────────────────────
+        // Only reachable when budget is NOT exceeded.
         self.call_api_and_cache(req, &shape, &pol, start).await
     }
 
@@ -200,7 +270,7 @@ impl Router {
                 "ollama",
                 result.confidence,
                 pol.ttl_secs,
-                pol.shareable,
+                pol.shareable && self.cfg.federation.share_cache,
             ).await?;
 
             // Store embedding if enabled
@@ -252,7 +322,7 @@ impl Router {
                 "anthropic",
                 None,
                 pol.ttl_secs,
-                pol.shareable,
+                pol.shareable && self.cfg.federation.share_cache,
             ).await?;
 
             if self.cfg.embedding.enabled {
@@ -299,6 +369,69 @@ impl Router {
             None,
             if saved_usd > 0.0 { Some(saved_usd) } else { None },
         ).await;
+    }
+
+    /// Cache an accumulated streaming response and record budget spend.
+    /// Called fire-and-forget after stream_to_channel completes.
+    /// `message_id` is the real Anthropic message ID from the SSE stream (may be empty on error).
+    pub async fn cache_streamed(
+        &self,
+        req:          &MessagesRequest,
+        text:         &str,
+        message_id:   &str,
+        input_tokens: u32,
+        output_tokens: u32,
+    ) {
+        use crate::backend::{ContentBlock, MessagesResponse, Usage};
+
+        // Always record spend — streaming bypasses the sync budget path entirely.
+        let _ = self.budget.record(&self.cfg.api.model, input_tokens, output_tokens).await;
+
+        if req.has_tools() || text.is_empty() {
+            return;
+        }
+
+        let prompt = req.prompt_text();
+        let shape  = domain::classify(&prompt);
+        let pol    = policy::infer(&shape, &prompt, &self.cfg);
+
+        if pol.bypass_cache || !pol.should_cache() {
+            return;
+        }
+
+        let id = if message_id.is_empty() {
+            format!("msg_{}", uuid::Uuid::new_v4().simple())
+        } else {
+            message_id.to_string()
+        };
+
+        let response = MessagesResponse {
+            id,
+            kind:        "message".to_string(),
+            role:        "assistant".to_string(),
+            content:     vec![ContentBlock { kind: "text".to_string(), text: Some(text.to_string()) }],
+            model:       self.cfg.api.model.clone(),
+            stop_reason: Some("end_turn".to_string()),
+            usage:       Usage { input_tokens, output_tokens },
+        };
+
+        let resp_json = match serde_json::to_string(&response) {
+            Ok(j) => j,
+            Err(e) => { warn!("stream cache serialize: {e}"); return; }
+        };
+
+        let shareable = pol.shareable && self.cfg.federation.share_cache;
+        match self.cache.store(&shape, &prompt, &resp_json, "anthropic", None, pol.ttl_secs, shareable).await {
+            Ok(cache_id) => {
+                info!("stream cached: {} ({output_tokens} output tokens)", &cache_id[..8]);
+                if self.cfg.embedding.enabled {
+                    if let Ok(emb) = self.embedder.embed(&prompt).await {
+                        let _ = self.cache.store_embedding(&cache_id, &emb, self.embedder.model()).await;
+                    }
+                }
+            }
+            Err(e) => warn!("stream cache store: {e}"),
+        }
     }
 }
 
