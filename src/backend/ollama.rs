@@ -30,17 +30,19 @@ impl OllamaBackend {
 // ── Ollama wire types ──────────────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct OllamaRequest<'a> {
-    model:    &'a str,
-    messages: Vec<OllamaMessage<'a>>,
+struct OllamaRequest {
+    model:    String,
+    messages: Vec<OllamaMessage>,
     stream:   bool,
     options:  OllamaOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format:   Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
-struct OllamaMessage<'a> {
-    role:    &'a str,
-    content: &'a str,
+struct OllamaMessage {
+    role:    String,
+    content: String,
 }
 
 #[derive(Serialize)]
@@ -62,33 +64,66 @@ struct OllamaMessageOut {
     content: String,
 }
 
+/// Parsed response from the structured-output wrapper.
+#[derive(Deserialize)]
+struct StructuredResponse {
+    answer:     String,
+    confidence: f64,
+}
+
+// ── System instruction for structured output ───────────────────────────────
+
+const CONFIDENCE_SYSTEM: &str =
+    "Respond ONLY with valid JSON matching this exact schema — no markdown, no extra text: \
+     {\"answer\": \"<your full response here>\", \"confidence\": <decimal 0.0-1.0>}. \
+     Set confidence to how confident you are in the correctness and completeness of the answer.";
+
+fn confidence_format_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "answer":     { "type": "string" },
+            "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+        },
+        "required": ["answer", "confidence"]
+    })
+}
+
+// ── Backend impl ──────────────────────────────────────────────────────────
+
 #[async_trait]
 impl ModelBackend for OllamaBackend {
     async fn complete(&self, req: &MessagesRequest) -> Result<BackendResult> {
         let start = Instant::now();
         let url   = format!("{}/api/chat", self.base_url);
 
-        let messages: Vec<OllamaMessage> = req
-            .messages
-            .iter()
-            .map(|m| {
-                let content = match &m.content {
-                    super::MessageContent::Text(t) => t.as_str(),
-                    super::MessageContent::Blocks(b) => b
-                        .iter()
-                        .filter_map(|b| b.text.as_deref())
-                        .next()
-                        .unwrap_or(""),
-                };
-                OllamaMessage { role: &m.role, content }
-            })
-            .collect();
+        // Build system message: merge confidence instruction with any user-provided system prompt.
+        let sys_content = match &req.system {
+            Some(user_sys) => format!("{CONFIDENCE_SYSTEM}\n\n{user_sys}"),
+            None           => CONFIDENCE_SYSTEM.to_string(),
+        };
+
+        let mut messages = Vec::with_capacity(req.messages.len() + 1);
+        messages.push(OllamaMessage { role: "system".into(), content: sys_content });
+
+        for m in &req.messages {
+            let content = match &m.content {
+                super::MessageContent::Text(t)    => t.clone(),
+                super::MessageContent::Blocks(bs) => bs
+                    .iter()
+                    .filter_map(|b| b.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            messages.push(OllamaMessage { role: m.role.clone(), content });
+        }
 
         let body = OllamaRequest {
-            model:    &self.model_id,
+            model:    self.model_id.clone(),
             messages,
             stream:   false,
             options:  OllamaOptions { temperature: 0.1 },
+            format:   Some(confidence_format_schema()),
         };
 
         let http_resp = self.client
@@ -105,6 +140,17 @@ impl ModelBackend for OllamaBackend {
 
         let ollama: OllamaResponse = http_resp.json().await?;
         let latency_ms = start.elapsed().as_millis() as u64;
+        let raw        = ollama.message.content.clone();
+
+        // Parse the structured response.  Fall back to the heuristic if the
+        // model ignored the format instruction.
+        let (answer_text, confidence) =
+            if let Ok(s) = serde_json::from_str::<StructuredResponse>(&raw) {
+                (s.answer, s.confidence.clamp(0.0, 1.0))
+            } else {
+                let conf = estimate_confidence(&raw, req.estimated_input_tokens());
+                (raw, conf)
+            };
 
         let response = MessagesResponse {
             id:          uuid::Uuid::new_v4().to_string(),
@@ -112,7 +158,7 @@ impl ModelBackend for OllamaBackend {
             role:        "assistant".into(),
             content:     vec![ContentBlock {
                 kind: "text".into(),
-                text: Some(ollama.message.content.clone()),
+                text: Some(answer_text),
             }],
             model:       self.model_id.clone(),
             stop_reason: Some("end_turn".into()),
@@ -121,10 +167,6 @@ impl ModelBackend for OllamaBackend {
                 output_tokens: ollama.eval_count,
             },
         };
-
-        // Confidence heuristic based on response length and latency.
-        // A very short response to a complex question is low-confidence.
-        let confidence = estimate_confidence(&ollama.message.content, req.estimated_input_tokens());
 
         Ok(BackendResult { response, confidence: Some(confidence), latency_ms })
     }
@@ -145,15 +187,12 @@ impl ModelBackend for OllamaBackend {
     }
 }
 
-/// Rough confidence score for a local model response.
-/// Longer, well-structured responses to short prompts = higher confidence.
-/// Very terse responses to long prompts = lower confidence.
+/// Fallback confidence heuristic used when the model does not return structured output.
 fn estimate_confidence(response_text: &str, input_tokens: u32) -> f64 {
     let resp_len  = response_text.len();
     let has_code  = response_text.contains("```");
     let has_punct = response_text.contains('.') || response_text.contains('\n');
 
-    // Very short response is suspect
     if resp_len < 20 {
         return 0.40;
     }

@@ -22,6 +22,19 @@ impl RoutingScore {
             && self.consequence < consequence_thresh
     }
 
+    /// Returns the primary reason this score failed the local-routing gate.
+    /// Consequence is checked first (highest user impact), then complexity, then novelty.
+    pub fn gate_miss_reason(
+        &self,
+        _novelty_t:    f64,
+        complexity_t:  f64,
+        consequence_t: f64,
+    ) -> &'static str {
+        if self.consequence >= consequence_t { "routing_gate_consequence" }
+        else if self.complexity  >= complexity_t  { "routing_gate_complexity"  }
+        else                                      { "routing_gate_novelty"     }
+    }
+
     pub fn display(&self) -> String {
         format!(
             "nov={:.2} cplx={:.2} cons={:.2}",

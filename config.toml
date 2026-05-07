@@ -25,17 +25,17 @@ dimensions  = 768
 [cache]
 db_path      = "claude-cache.db"
 max_size_mb  = 500
-default_ttl_secs = 3600
+default_ttl_secs = 604800  # 7 days
 
 [cache.domain_ttl]
-rust       = 86400
-python     = 43200
-javascript = 21600
-typescript = 21600
-sql        = 86400
-shell      = 7200
-assembly   = 604800
-general    = 3600
+rust       = 604800   # 7 days
+python     = 604800
+javascript = 259200   # 3 days
+typescript = 259200
+sql        = 604800
+shell      = 86400    # 1 day
+assembly   = 2592000  # 30 days
+general    = 604800
 
 [routing]
 novelty_threshold     = 0.60

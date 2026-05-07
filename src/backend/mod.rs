@@ -66,7 +66,8 @@ pub struct Usage {
 }
 
 impl MessagesRequest {
-    /// Extract the concatenated text of all user messages — used for cache keying.
+    /// Extract the concatenated text of all user messages — used for classification
+    /// and embedding.  The system prompt is handled separately via `normalized_system`.
     pub fn prompt_text(&self) -> String {
         self.messages
             .iter()
@@ -81,6 +82,18 @@ impl MessagesRequest {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Normalize the optional system prompt to a canonical string for cache-key
+    /// computation.  Returns `None` if there is no system prompt or it is empty.
+    pub fn normalized_system(&self) -> Option<String> {
+        self.system.as_ref().and_then(|s| {
+            let text = match s {
+                serde_json::Value::String(str) => str.trim().to_string(),
+                v => v.to_string(),
+            };
+            if text.is_empty() { None } else { Some(text) }
+        })
     }
 
     pub fn has_tools(&self) -> bool {

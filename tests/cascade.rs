@@ -252,7 +252,7 @@ async fn cache_hit_returns_saved_response() {
         usage:       Usage { input_tokens: 5, output_tokens: 10 },
     }).unwrap();
 
-    env.cache.store(&shape, prompt, &stored_resp, "anthropic", None, Some(3600), false).await.unwrap();
+    env.cache.store(&shape, prompt, None, &stored_resp, "anthropic", None, Some(3600), false, false).await.unwrap();
 
     // Route the same prompt — must hit cache
     let router = env.router_force_api();
@@ -396,32 +396,170 @@ fn complexity_low_for_hello_world() {
     assert!(shape.complexity < 0.5, "complexity={} should be < 0.5", shape.complexity);
 }
 
+// TypeScript is classified as typescript, not javascript, even when generic JS
+// keywords like "const" or "let" are present.
+#[test]
+fn domain_classify_typescript() {
+    let shape = claude_cache::domain::classify(
+        "create an interface with optional fields in TypeScript"
+    );
+    assert_eq!(shape.domain, "typescript");
+}
+
+#[test]
+fn domain_classify_typescript_beats_javascript() {
+    let shape = claude_cache::domain::classify(
+        "const greeting: string = 'hello' — how do I annotate types in TypeScript"
+    );
+    assert_eq!(shape.domain, "typescript",
+        "': string' and 'typescript' should beat generic JS keywords like 'const'");
+}
+
+// Multi-domain prompts: primary language should win over secondary.
+#[test]
+fn domain_classify_multi_domain_primary_wins() {
+    let shape = claude_cache::domain::classify(
+        "write a Python script using pandas to query a PostgreSQL database"
+    );
+    assert_eq!(shape.domain, "python",
+        "Python-specific signals (pandas, def, self) should dominate SQL keywords");
+}
+
 // ── Cache key / content-addressing tests ─────────────────────────────────────
 
 #[test]
 fn cache_key_is_deterministic() {
-    let k1 = CacheStore::content_key("what is rust");
-    let k2 = CacheStore::content_key("what is rust");
+    let k1 = CacheStore::content_key("what is rust", None);
+    let k2 = CacheStore::content_key("what is rust", None);
     assert_eq!(k1, k2);
 }
 
 #[test]
 fn cache_key_normalizes_whitespace() {
-    let k1 = CacheStore::content_key("what  is   rust");
-    let k2 = CacheStore::content_key("what is rust");
+    let k1 = CacheStore::content_key("what  is   rust", None);
+    let k2 = CacheStore::content_key("what is rust", None);
     assert_eq!(k1, k2, "extra whitespace should be normalized");
 }
 
 #[test]
 fn cache_key_normalizes_case() {
-    let k1 = CacheStore::content_key("What Is Rust");
-    let k2 = CacheStore::content_key("what is rust");
+    let k1 = CacheStore::content_key("What Is Rust", None);
+    let k2 = CacheStore::content_key("what is rust", None);
     assert_eq!(k1, k2, "case should be normalized");
 }
 
 #[test]
 fn cache_key_differs_for_different_prompts() {
-    let k1 = CacheStore::content_key("what is rust");
-    let k2 = CacheStore::content_key("what is python");
+    let k1 = CacheStore::content_key("what is rust", None);
+    let k2 = CacheStore::content_key("what is python", None);
     assert_ne!(k1, k2);
+}
+
+#[test]
+fn cache_key_differs_with_different_system_prompts() {
+    let k_no_sys  = CacheStore::content_key("explain closures", None);
+    let k_sys_a   = CacheStore::content_key("explain closures", Some("You are a strict code reviewer."));
+    let k_sys_b   = CacheStore::content_key("explain closures", Some("You are a friendly tutor."));
+    assert_ne!(k_no_sys, k_sys_a, "system vs no-system must differ");
+    assert_ne!(k_sys_a,  k_sys_b, "different system prompts must differ");
+}
+
+#[test]
+fn cache_key_same_system_prompt_matches() {
+    let k1 = CacheStore::content_key("explain closures", Some("You are a strict code reviewer."));
+    let k2 = CacheStore::content_key("explain closures", Some("You are a strict code reviewer."));
+    assert_eq!(k1, k2, "identical system prompts must produce same key");
+}
+
+#[tokio::test]
+async fn system_prompt_isolates_cache_entries() {
+    let env = Env::new().await;
+    let shape = ShapeKey { domain: "rust".into(), intent: "explain".into(), complexity: 0.3 };
+    let prompt = "explain closures";
+
+    let resp_a = serde_json::to_string(&MessagesResponse {
+        id: "a".into(), kind: "message".into(), role: "assistant".into(),
+        content: vec![ContentBlock { kind: "text".into(), text: Some("strict answer".into()) }],
+        model: "anthropic".into(), stop_reason: Some("end_turn".into()),
+        usage: Usage { input_tokens: 5, output_tokens: 10 },
+    }).unwrap();
+    let resp_b = serde_json::to_string(&MessagesResponse {
+        id: "b".into(), kind: "message".into(), role: "assistant".into(),
+        content: vec![ContentBlock { kind: "text".into(), text: Some("friendly answer".into()) }],
+        model: "anthropic".into(), stop_reason: Some("end_turn".into()),
+        usage: Usage { input_tokens: 5, output_tokens: 10 },
+    }).unwrap();
+
+    env.cache.store(&shape, prompt, Some("strict reviewer"), &resp_a, "anthropic", None, Some(3600), false, false).await.unwrap();
+    env.cache.store(&shape, prompt, Some("friendly tutor"),  &resp_b, "anthropic", None, Some(3600), false, false).await.unwrap();
+
+    // Each system prompt should retrieve its own cached response
+    let hit_a = env.cache.lookup_exact(prompt, Some("strict reviewer")).await.unwrap().unwrap();
+    let hit_b = env.cache.lookup_exact(prompt, Some("friendly tutor")).await.unwrap().unwrap();
+    assert!(hit_a.response.contains("strict answer"),   "wrong entry for strict system");
+    assert!(hit_b.response.contains("friendly answer"), "wrong entry for friendly system");
+
+    // No system prompt → no hit (different key)
+    let hit_none = env.cache.lookup_exact(prompt, None).await.unwrap();
+    assert!(hit_none.is_none(), "no-system query must not match system-prompt entry");
+}
+
+#[tokio::test]
+async fn pinned_entry_survives_eviction() {
+    let env = Env::new().await;
+    let shape = ShapeKey { domain: "rust".into(), intent: "explain".into(), complexity: 0.3 };
+
+    let make_resp = |id: &str, text: &str| serde_json::to_string(&MessagesResponse {
+        id: id.into(), kind: "message".into(), role: "assistant".into(),
+        content: vec![ContentBlock { kind: "text".into(), text: Some(text.into()) }],
+        model: "anthropic".into(), stop_reason: Some("end_turn".into()),
+        usage: Usage { input_tokens: 5, output_tokens: 10 },
+    }).unwrap();
+
+    // Store a pinned entry with a very short TTL
+    let pinned_resp = make_resp("pinned-1", "pinned answer");
+    let pinned_id = env.cache.store(&shape, "pinned prompt", None, &pinned_resp, "anthropic", None, Some(1), false, true).await.unwrap();
+
+    // Store some regular (unpinned) entries with expired TTL
+    for i in 0..3 {
+        let r = make_resp(&format!("exp-{i}"), &format!("expired answer {i}"));
+        env.cache.store(&shape, &format!("expired prompt {i}"), None, &r, "anthropic", None, Some(1), false, false).await.unwrap();
+    }
+
+    // Evict expired — pinned entry must survive
+    env.cache.evict_expired().await.unwrap();
+
+    let still_there = env.cache.lookup_exact("pinned prompt", None).await.unwrap();
+    assert!(still_there.is_some(), "pinned entry should survive TTL eviction (id={pinned_id})");
+}
+
+#[tokio::test]
+async fn search_entries_returns_matching_results() {
+    let env = Env::new().await;
+    let shape_rust = ShapeKey { domain: "rust".into(), intent: "explain".into(), complexity: 0.3 };
+    let shape_py   = ShapeKey { domain: "python".into(), intent: "generate".into(), complexity: 0.4 };
+
+    let dummy_resp = |text: &str| serde_json::to_string(&MessagesResponse {
+        id: "x".into(), kind: "message".into(), role: "assistant".into(),
+        content: vec![ContentBlock { kind: "text".into(), text: Some(text.into()) }],
+        model: "anthropic".into(), stop_reason: Some("end_turn".into()),
+        usage: Usage { input_tokens: 5, output_tokens: 10 },
+    }).unwrap();
+
+    env.cache.store(&shape_rust, "explain lifetimes in Rust",      None, &dummy_resp("a"), "anthropic", None, Some(3600), false, false).await.unwrap();
+    env.cache.store(&shape_rust, "explain borrow checker in Rust",  None, &dummy_resp("b"), "anthropic", None, Some(3600), false, false).await.unwrap();
+    env.cache.store(&shape_py,   "write a Python pandas script",    None, &dummy_resp("c"), "anthropic", None, Some(3600), false, false).await.unwrap();
+
+    // Search by keyword
+    let results = env.cache.search_entries(Some("lifetimes"), None, 10).await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].prompt_preview.contains("lifetimes"));
+
+    // Filter by domain
+    let rust_results = env.cache.search_entries(None, Some("rust"), 10).await.unwrap();
+    assert_eq!(rust_results.len(), 2);
+
+    // No filter returns all
+    let all = env.cache.search_entries(None, None, 10).await.unwrap();
+    assert_eq!(all.len(), 3);
 }

@@ -357,29 +357,57 @@ async fn run_server(
     let addr     = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    info!("dashboard:  http://{addr}");
-    if is_cnc {
-        info!("CNC peers:  GET  http://{addr}/v1/federation/peers");
-        info!("CNC trust:  POST http://{addr}/v1/trust/:node_id");
-        info!("CNC evict:  POST http://{addr}/v1/evict/:node_id");
+    info!("─── endpoints ───────────────────────────────────────────");
+    info!("  POST  http://{addr}/v1/messages          (proxy)");
+    info!("  GET   http://{addr}/health");
+    if cfg.federation.enabled {
+        info!("  POST  http://{addr}/v1/federation/announce");
+        info!("  GET   http://{addr}/v1/federation/peers");
+        info!("  GET   http://{addr}/v1/federation/lookup/:hash");
+        info!("  POST  http://{addr}/v1/federation/semantic");
+        info!("  GET   http://{addr}/v1/federation/revocations");
+        info!("  POST  http://{addr}/v1/federation/revocations");
     }
+    info!("─── portal (protected) ──────────────────────────────────");
+    info!("  GET   http://{addr}/                     (dashboard)");
+    info!("  GET   http://{addr}/stats");
+    info!("  GET   http://{addr}/api/overview");
+    info!("  GET   http://{addr}/api/cache");
+    info!("  GET   http://{addr}/api/cache/search");
+    info!("  GET   http://{addr}/api/spend");
+    info!("  POST  http://{addr}/api/pricing");
+    info!("  GET   http://{addr}/api/trust");
+    info!("  GET   http://{addr}/api/peers/health");
+    info!("  GET   http://{addr}/api/routing");
+    info!("─── cache management ────────────────────────────────────");
+    info!("  GET   http://{addr}/v1/cache/export");
+    info!("  POST  http://{addr}/v1/cache/seed");
+    info!("  POST  http://{addr}/v1/cache/entries/:id/pin");
+    info!("  DELETE http://{addr}/v1/cache/entries/:id");
+    if is_cnc {
+        info!("─── trust / eviction (CNC) ──────────────────────────────");
+        info!("  GET   http://{addr}/v1/trust");
+        info!("  POST  http://{addr}/v1/trust/:node_id");
+        info!("  POST  http://{addr}/v1/evict/:node_id");
+    }
+    info!("─────────────────────────────────────────────────────────");
     if cfg.limits.messages_per_minute > 0 {
         info!("rate limit: {} req/min on POST /v1/messages", cfg.limits.messages_per_minute);
     }
 
-    let drain_timeout = std::time::Duration::from_secs(cfg.limits.shutdown_timeout_secs);
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal());
+    let drain_secs = cfg.limits.shutdown_timeout_secs;
 
-    // Race the graceful drain against the configured timeout so a stuck
-    // in-flight request can't hold the process open indefinitely.
-    tokio::select! {
-        result = server => { result?; }
-        _ = tokio::time::sleep(drain_timeout) => {
-            tracing::warn!("graceful-shutdown drain timeout ({}s) exceeded; forcing exit",
-                drain_timeout.as_secs());
-        }
-    }
+    // Wait for SIGTERM/Ctrl+C, then give in-flight requests up to drain_secs
+    // to complete before forcing exit.  The sleep starts AFTER the signal so
+    // the node runs indefinitely until explicitly stopped.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            info!("shutting down — draining in-flight requests (up to {drain_secs}s)");
+            tokio::time::sleep(std::time::Duration::from_secs(drain_secs)).await;
+        })
+        .await?;
+
     Ok(())
 }
 

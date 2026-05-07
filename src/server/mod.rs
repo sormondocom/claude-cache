@@ -1,10 +1,10 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router as AxumRouter,
 };
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
@@ -95,6 +95,11 @@ pub fn build_router(state: SharedState) -> AxumRouter {
         .route("/api/trust",        get(crate::portal::handle_trust_nodes))
         .route("/api/peers/health", get(crate::portal::handle_peer_health))
         .route("/api/routing",      get(crate::portal::handle_routing_log))
+        .route("/api/cache/search", get(crate::portal::handle_cache_search))
+        .route("/v1/cache/export",             get(handle_export_cache))
+        .route("/v1/cache/seed",               post(handle_seed_cache))
+        .route("/v1/cache/entries/:id/pin",    post(handle_pin_cache_entry))
+        .route("/v1/cache/entries/:id",        delete(handle_delete_cache_entry))
         .layer(middleware::from_fn_with_state(state.clone(), require_portal_token));
 
     // Rate limiter for /v1/messages — None when rate_limit_rpm == 0 (disabled).
@@ -567,6 +572,122 @@ async fn handle_receive_revocation(
             warn!("revocation apply error: {e}");
             (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
         }
+    }
+}
+
+// ── Cache management endpoints ─────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct SeedCacheBody {
+    prompt:  String,
+    response: String,
+    #[serde(default)]
+    system:  Option<String>,
+    #[serde(default)]
+    model:   Option<String>,
+    #[serde(default)]
+    domain:  Option<String>,
+    #[serde(default)]
+    pinned:  bool,
+}
+
+async fn handle_seed_cache(
+    State(state): State<SharedState>,
+    Json(body):   Json<SeedCacheBody>,
+) -> Response {
+    use crate::domain::{classify, ShapeKey};
+
+    let shape = if let Some(ref d) = body.domain {
+        ShapeKey { domain: d.clone(), intent: "generate".into(), complexity: 0.3 }
+    } else {
+        classify(&body.prompt)
+    };
+
+    let model = body.model.as_deref().unwrap_or("seeded");
+    let ttl   = if body.pinned { None } else { Some(604_800u64) }; // 7 days for seeded entries
+
+    match state.cache.store(
+        &shape,
+        &body.prompt,
+        body.system.as_deref(),
+        &body.response,
+        model,
+        None,
+        ttl,
+        false,
+        body.pinned,
+    ).await {
+        Ok(id) => Json(serde_json::json!({ "ok": true, "id": id, "pinned": body.pinned })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PinBody {
+    #[serde(default = "bool_true")]
+    pinned: bool,
+}
+fn bool_true() -> bool { true }
+
+async fn handle_pin_cache_entry(
+    State(state): State<SharedState>,
+    Path(id):     Path<String>,
+    body:         Option<Json<PinBody>>,
+) -> Response {
+    let pinned = body.map(|b| b.pinned).unwrap_or(true);
+    match state.cache.set_pinned(&id, pinned).await {
+        Ok(true)  => Json(serde_json::json!({ "ok": true, "id": id, "pinned": pinned })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "entry not found"}))).into_response(),
+        Err(e)    => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn handle_delete_cache_entry(
+    State(state): State<SharedState>,
+    Path(id):     Path<String>,
+) -> Response {
+    match state.cache.delete_entry(&id).await {
+        Ok(true)  => Json(serde_json::json!({ "ok": true, "id": id })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "entry not found"}))).into_response(),
+        Err(e)    => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ── Cache export ──────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct ExportParams {
+    #[serde(default)]
+    domain:  Option<String>,
+    #[serde(default)]
+    pinned:  Option<bool>,
+    #[serde(default)]
+    limit:   Option<i64>,
+}
+
+async fn handle_export_cache(
+    State(state): State<SharedState>,
+    Query(params): Query<ExportParams>,
+) -> Response {
+    let limit       = params.limit.unwrap_or(1000).min(5000);
+    let pinned_only = params.pinned.unwrap_or(false);
+
+    match state.cache.export_entries(params.domain.as_deref(), pinned_only, limit).await {
+        Ok(entries) => {
+            let body = match serde_json::to_vec(&entries) {
+                Ok(b) => b,
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+            };
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .header("content-disposition", "attachment; filename=\"cache-export.json\"")
+                .body(axum::body::Body::from(body))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 }
 

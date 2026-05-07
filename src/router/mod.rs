@@ -79,7 +79,9 @@ impl Router {
         // Tools require live API semantics; never route locally.
         if req.has_tools() {
             debug!("tool-use fast-path → api");
-            return self.call_api(req, start).await;
+            return self.call_api_and_cache(req, &domain::classify(&prompt),
+                &policy::infer(&domain::classify(&prompt), &prompt, &self.cfg),
+                start, Some("tool_use")).await;
         }
 
         // ── Step 1: Classify ─────────────────────────────────────────────
@@ -90,16 +92,16 @@ impl Router {
         let pol = policy::infer(&shape, &prompt, &self.cfg);
         if pol.bypass_cache {
             debug!("policy bypass → api");
-            return self.call_api(req, start).await;
+            return self.call_api_and_cache(req, &shape, &pol, start, Some("policy_bypass")).await;
         }
 
         // ── Step 3: Exact cache ──────────────────────────────────────────
-        if let Some(entry) = self.cache.lookup_exact(&prompt).await? {
+        if let Some(entry) = self.cache.lookup_exact(&prompt, req.normalized_system().as_deref()).await? {
             info!("exact cache hit: {}", &entry.id[..8]);
             let resp = serde_json::from_str(&entry.response)?;
             let latency_ms = start.elapsed().as_millis() as u64;
             let saved = estimate_api_cost(&self.budget, req).await;
-            self.log(&shape, RouteDecision::ExactCache, "cache", latency_ms, req, saved).await;
+            self.log(&shape, RouteDecision::ExactCache, "cache", latency_ms, req, saved, None).await;
             return Ok(RoutedResponse {
                 response: resp,
                 decision: RouteDecision::ExactCache,
@@ -111,7 +113,7 @@ impl Router {
         // ── Step 3.5: Federation exact lookup ─────────────────────────────
         // Ask trusted peers if they have the exact same prompt hash.
         if let Some(ref fed) = self.federation {
-            let hash = CacheStore::content_key(&prompt);
+            let hash = CacheStore::content_key(&prompt, req.normalized_system().as_deref());
             if let Some(fed_entry) = fed.lookup(&hash).await {
                 info!("federation exact hit from {}", &fed_entry.node_id[..16.min(fed_entry.node_id.len())]);
                 let resp: MessagesResponse = serde_json::from_str(&fed_entry.response)?;
@@ -119,11 +121,11 @@ impl Router {
                 let saved = estimate_api_cost(&self.budget, req).await;
                 let pol = policy::infer(&shape, &prompt, &self.cfg);
                 if pol.should_cache() {
-                    let _ = self.cache.store(&shape, &prompt, &fed_entry.response,
-                        "federated", None, pol.ttl_secs, false).await;
+                    let _ = self.cache.store(&shape, &prompt, req.normalized_system().as_deref(),
+                        &fed_entry.response, "federated", None, pol.ttl_secs, false, false).await;
                 }
                 let node_id = fed_entry.node_id.clone();
-                self.log(&shape, RouteDecision::FederationPeer(node_id.clone()), "federation", latency_ms, req, saved).await;
+                self.log(&shape, RouteDecision::FederationPeer(node_id.clone()), "federation", latency_ms, req, saved, None).await;
                 return Ok(RoutedResponse {
                     response: resp,
                     decision: RouteDecision::FederationPeer(node_id),
@@ -144,6 +146,9 @@ impl Router {
         };
 
         // ── Step 4a: Local semantic cache ─────────────────────────────────
+        // Also capture the best similarity found below threshold so the routing
+        // gate can tell "near miss" apart from "truly never seen".
+        let mut best_semantic_sim: Option<f64> = None;
         if let Some(ref emb) = embedding {
             let hits = self.cache.lookup_semantic(
                 &shape.domain, emb, self.cfg.embedding.sim_threshold, 1,
@@ -153,7 +158,7 @@ impl Router {
                 let resp = serde_json::from_str(&entry.response)?;
                 let latency_ms = start.elapsed().as_millis() as u64;
                 let saved = estimate_api_cost(&self.budget, req).await;
-                self.log(&shape, RouteDecision::SemanticCache, "cache", latency_ms, req, saved).await;
+                self.log(&shape, RouteDecision::SemanticCache, "cache", latency_ms, req, saved, None).await;
                 return Ok(RoutedResponse {
                     response: resp,
                     decision: RouteDecision::SemanticCache,
@@ -161,6 +166,9 @@ impl Router {
                     saved_usd: saved,
                 });
             }
+            // No hit above threshold — probe for near-miss similarity so the
+            // routing gate knows how familiar this prompt shape actually is.
+            best_semantic_sim = self.cache.best_semantic_sim(&shape.domain, emb).await.ok().flatten();
         }
 
         // ── Step 4b: Federation semantic lookup ───────────────────────────
@@ -177,15 +185,15 @@ impl Router {
                 // Cache locally so future identical prompts skip the peer call.
                 let pol = policy::infer(&shape, &prompt, &self.cfg);
                 if pol.should_cache() {
-                    if let Ok(cid) = self.cache.store(&shape, &prompt, &fed_entry.response,
-                            "federated", None, pol.ttl_secs, false).await {
+                    if let Ok(cid) = self.cache.store(&shape, &prompt, req.normalized_system().as_deref(),
+                            &fed_entry.response, "federated", None, pol.ttl_secs, false, false).await {
                         if let Some(ref emb2) = embedding {
                             let _ = self.cache.store_embedding(&cid, emb2, self.embedder.model()).await;
                         }
                     }
                 }
                 let node_id = fed_entry.node_id.clone();
-                self.log(&shape, RouteDecision::FederationPeer(node_id.clone()), "federation", latency_ms, req, saved).await;
+                self.log(&shape, RouteDecision::FederationPeer(node_id.clone()), "federation", latency_ms, req, saved, None).await;
                 return Ok(RoutedResponse {
                     response: resp,
                     decision: RouteDecision::FederationPeer(node_id),
@@ -195,21 +203,19 @@ impl Router {
             }
         }
 
-        // semantic_sim is always None here (hits would have returned early above)
-        let semantic_sim: Option<f64> = None;
-
         // ── Step 5: Routing gate ──────────────────────────────────────────
         // How familiar are we with this domain+intent shape?
         let hit_count = self.cache.domain_hit_count(&shape.domain, &shape.intent)
             .await
             .unwrap_or(0);
-        let score = scoring::score_prompt(&shape, &prompt, hit_count, semantic_sim);
+        let score = scoring::score_prompt(&shape, &prompt, hit_count, best_semantic_sim);
         debug!("routing score: {}", score.display());
 
         let r = &self.cfg.routing;
         if !score.should_use_local(r.novelty_threshold, r.complexity_threshold, r.consequence_threshold) {
-            debug!("routing gate → api ({})", score.display());
-            return self.call_api_and_cache(req, &shape, &pol, start).await;
+            let miss = score.gate_miss_reason(r.novelty_threshold, r.complexity_threshold, r.consequence_threshold);
+            debug!("routing gate → api ({}) miss={miss}", score.display());
+            return self.call_api_and_cache(req, &shape, &pol, start, Some(miss)).await;
         }
 
         // ── Step 6: Budget gate ───────────────────────────────────────────
@@ -225,7 +231,10 @@ impl Router {
                 Ok(None) if budget_exceeded => {
                     anyhow::bail!("daily budget exceeded and local model confidence below floor");
                 }
-                Ok(None) => debug!("local model confidence too low → api"),
+                Ok(None) => {
+                    debug!("local model confidence too low → api");
+                    return self.call_api_and_cache(req, &shape, &pol, start, Some("low_confidence")).await;
+                }
                 Err(e) if budget_exceeded => {
                     anyhow::bail!("daily budget exceeded and local model unavailable: {e}");
                 }
@@ -236,8 +245,8 @@ impl Router {
         }
 
         // ── Step 8: Anthropic API (last resort) ───────────────────────────
-        // Only reachable when budget is NOT exceeded.
-        self.call_api_and_cache(req, &shape, &pol, start).await
+        // Only reachable when local model errored and budget is NOT exceeded.
+        self.call_api_and_cache(req, &shape, &pol, start, Some("local_error")).await
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -266,11 +275,13 @@ impl Router {
             let cache_id  = self.cache.store(
                 shape,
                 &req.prompt_text(),
+                req.normalized_system().as_deref(),
                 &resp_json,
                 "ollama",
                 result.confidence,
                 pol.ttl_secs,
                 pol.shareable && self.cfg.federation.share_cache,
+                false,
             ).await?;
 
             // Store embedding if enabled
@@ -281,7 +292,7 @@ impl Router {
             }
         }
 
-        self.log(shape, RouteDecision::LocalModel, "ollama", latency_ms, req, saved).await;
+        self.log(shape, RouteDecision::LocalModel, "ollama", latency_ms, req, saved, None).await;
         Ok(Some(RoutedResponse {
             response:   result.response,
             decision:   RouteDecision::LocalModel,
@@ -290,24 +301,15 @@ impl Router {
         }))
     }
 
-    async fn call_api(&self, req: &MessagesRequest, start: Instant) -> Result<RoutedResponse> {
-        let result     = self.api.complete(req).await?;
-        let latency_ms = start.elapsed().as_millis() as u64;
-        self.record_spend(&result, req).await;
-        Ok(RoutedResponse {
-            response:   result.response,
-            decision:   RouteDecision::Api,
-            latency_ms,
-            saved_usd:  0.0,
-        })
-    }
+
 
     async fn call_api_and_cache(
         &self,
-        req:   &MessagesRequest,
-        shape: &domain::ShapeKey,
-        pol:   &policy::CachePolicy,
-        start: Instant,
+        req:         &MessagesRequest,
+        shape:       &domain::ShapeKey,
+        pol:         &policy::CachePolicy,
+        start:       Instant,
+        miss_reason: Option<&str>,
     ) -> Result<RoutedResponse> {
         let result     = self.api.complete(req).await?;
         let latency_ms = start.elapsed().as_millis() as u64;
@@ -318,11 +320,13 @@ impl Router {
             let cache_id  = self.cache.store(
                 shape,
                 &req.prompt_text(),
+                req.normalized_system().as_deref(),
                 &resp_json,
                 "anthropic",
                 None,
                 pol.ttl_secs,
                 pol.shareable && self.cfg.federation.share_cache,
+                false,
             ).await?;
 
             if self.cfg.embedding.enabled {
@@ -332,7 +336,7 @@ impl Router {
             }
         }
 
-        self.log(shape, RouteDecision::Api, "anthropic", latency_ms, req, 0.0).await;
+        self.log(shape, RouteDecision::Api, "anthropic", latency_ms, req, 0.0, miss_reason).await;
         Ok(RoutedResponse {
             response:   result.response,
             decision:   RouteDecision::Api,
@@ -352,12 +356,13 @@ impl Router {
 
     async fn log(
         &self,
-        shape:      &domain::ShapeKey,
-        decision:   RouteDecision,
-        backend:    &str,
-        latency_ms: u64,
-        req:        &MessagesRequest,
-        saved_usd:  f64,
+        shape:       &domain::ShapeKey,
+        decision:    RouteDecision,
+        backend:     &str,
+        latency_ms:  u64,
+        req:         &MessagesRequest,
+        saved_usd:   f64,
+        miss_reason: Option<&str>,
     ) {
         let tin = req.estimated_input_tokens() as i64;
         let _ = self.cache.log_routing(
@@ -368,6 +373,7 @@ impl Router {
             Some(tin),
             None,
             if saved_usd > 0.0 { Some(saved_usd) } else { None },
+            miss_reason,
         ).await;
     }
 
@@ -421,7 +427,7 @@ impl Router {
         };
 
         let shareable = pol.shareable && self.cfg.federation.share_cache;
-        match self.cache.store(&shape, &prompt, &resp_json, "anthropic", None, pol.ttl_secs, shareable).await {
+        match self.cache.store(&shape, &prompt, req.normalized_system().as_deref(), &resp_json, "anthropic", None, pol.ttl_secs, shareable, false).await {
             Ok(cache_id) => {
                 info!("stream cached: {} ({output_tokens} output tokens)", &cache_id[..8]);
                 if self.cfg.embedding.enabled {

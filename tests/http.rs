@@ -10,7 +10,7 @@ use tempfile::tempdir;
 use claude_cache::{
     auth::Credentials,
     backend::{
-        AnthropicBackend, BackendResult, ContentBlock, Message, MessageContent,
+        AnthropicBackend, BackendResult, ContentBlock,
         MessagesRequest, MessagesResponse, ModelBackend, Usage,
     },
     budget::BudgetLedger,
@@ -457,6 +457,124 @@ async fn portal_auth_does_not_block_messages_or_health() {
         .json(&user_msg("auth bypass check"))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn seed_cache_creates_entry_and_messages_returns_it() {
+    let (base, _dir) = start_server(ServerParams::force_api(10.0)).await;
+    let client = reqwest::Client::new();
+
+    // Seed a cache entry.
+    let seed_resp = client
+        .post(format!("{base}/v1/cache/seed"))
+        .json(&json!({
+            "prompt":   "what is a Rust lifetime?",
+            "response": r#"{"id":"seeded","type":"message","role":"assistant","content":[{"type":"text","text":"lifetimes are annotations"}],"model":"seeded","stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":10}}"#,
+            "domain":   "rust"
+        }))
+        .send().await.unwrap();
+    assert_eq!(seed_resp.status(), 200);
+    let seed_json: Value = seed_resp.json().await.unwrap();
+    assert_eq!(seed_json["ok"], true);
+    let id = seed_json["id"].as_str().unwrap().to_string();
+    assert!(!id.is_empty());
+
+    // Same prompt should now hit the cache.
+    let msg_resp = client
+        .post(format!("{base}/v1/messages"))
+        .json(&user_msg("what is a Rust lifetime?"))
+        .send().await.unwrap();
+    assert_eq!(msg_resp.status(), 200);
+    assert_eq!(msg_resp.headers()["x-router-source"], "exact_cache");
+}
+
+#[tokio::test]
+async fn delete_cache_entry_removes_it() {
+    let (base, _dir) = start_server(ServerParams::force_api(10.0)).await;
+    let client = reqwest::Client::new();
+
+    // Create an entry via /v1/messages.
+    client.post(format!("{base}/v1/messages")).json(&user_msg("explain Rust traits")).send().await.unwrap();
+
+    // Get its ID from the search endpoint.
+    let search: Value = reqwest::get(format!("{base}/api/cache/search?q=traits"))
+        .await.unwrap()
+        .json().await.unwrap();
+    let entries = search["entries"].as_array().unwrap();
+    assert!(!entries.is_empty(), "entry must exist before delete");
+    let id = entries[0]["id"].as_str().unwrap().to_string();
+
+    // Delete it.
+    let del = client.delete(format!("{base}/v1/cache/entries/{id}")).send().await.unwrap();
+    assert_eq!(del.status(), 200);
+    let del_body: Value = del.json().await.unwrap();
+    assert_eq!(del_body["ok"], true);
+
+    // Deleting again → 404.
+    let del2 = client.delete(format!("{base}/v1/cache/entries/{id}")).send().await.unwrap();
+    assert_eq!(del2.status(), 404);
+}
+
+#[tokio::test]
+async fn pin_cache_entry_survives_eviction_search() {
+    let (base, _dir) = start_server(ServerParams::force_api(10.0)).await;
+    let client = reqwest::Client::new();
+
+    // Seed a pinned entry directly.
+    let seed: Value = client
+        .post(format!("{base}/v1/cache/seed"))
+        .json(&json!({
+            "prompt":   "explain monads",
+            "response": r#"{"id":"x","type":"message","role":"assistant","content":[{"type":"text","text":"monads are monoids"}],"model":"seeded","stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":5}}"#,
+            "pinned":   true
+        }))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    assert_eq!(seed["ok"], true);
+    assert_eq!(seed["pinned"], true);
+
+    // Verify it appears in search with pinned=true.
+    let search: Value = reqwest::get(format!("{base}/api/cache/search?q=monads"))
+        .await.unwrap()
+        .json().await.unwrap();
+    let entries = search["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["pinned"], true);
+
+    // Unpin it.
+    let id = entries[0]["id"].as_str().unwrap();
+    let unpin: Value = client
+        .post(format!("{base}/v1/cache/entries/{id}/pin"))
+        .json(&json!({ "pinned": false }))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    assert_eq!(unpin["ok"], true);
+    assert_eq!(unpin["pinned"], false);
+}
+
+#[tokio::test]
+async fn cache_search_filters_by_domain() {
+    let (base, _dir) = start_server(ServerParams::force_api(10.0)).await;
+    let client = reqwest::Client::new();
+
+    // Seed entries in different domains.
+    for (prompt, domain) in [
+        ("explain closures in Rust", "rust"),
+        ("how to use async in Python", "python"),
+    ] {
+        let response = format!(r#"{{"id":"x","type":"message","role":"assistant","content":[{{"type":"text","text":"{domain} answer"}}],"model":"seeded","stop_reason":"end_turn","usage":{{"input_tokens":5,"output_tokens":5}}}}"#);
+        client.post(format!("{base}/v1/cache/seed"))
+            .json(&json!({ "prompt": prompt, "response": response, "domain": domain }))
+            .send().await.unwrap();
+    }
+
+    // Filter to rust only.
+    let search: Value = reqwest::get(format!("{base}/api/cache/search?domain=rust"))
+        .await.unwrap()
+        .json().await.unwrap();
+    let entries = search["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "domain=rust filter must return only rust entries");
+    assert_eq!(entries[0]["domain"], "rust");
 }
 
 #[tokio::test]

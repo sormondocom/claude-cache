@@ -257,7 +257,7 @@ impl Default for AppConfig {
             cache: CacheConfig {
                 db_path:          "claude-cache.db".into(),
                 max_size_mb:      500,
-                default_ttl_secs: 3600,
+                default_ttl_secs: 604_800, // 7 days
                 domain_ttl:       HashMap::new(),
             },
             routing: RoutingConfig {

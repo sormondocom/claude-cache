@@ -171,10 +171,10 @@ async fn evict_purges_cache_entries_from_that_node() {
     let cache2_path = dir2.path().join("c2.db").to_str().unwrap().to_string();
     let peer_cache = CacheStore::open(&cache2_path, &peer.fingerprint).await.unwrap();
 
-    peer_cache.store(&shape, "rust question 1", r#"{"id":"r1","type":"message","role":"assistant","content":[{"type":"text","text":"ans1"}],"model":"x","usage":{"input_tokens":1,"output_tokens":1}}"#,
-        "anthropic", None, Some(3600), true).await.unwrap();
-    peer_cache.store(&shape, "rust question 2", r#"{"id":"r2","type":"message","role":"assistant","content":[{"type":"text","text":"ans2"}],"model":"x","usage":{"input_tokens":1,"output_tokens":1}}"#,
-        "anthropic", None, Some(3600), true).await.unwrap();
+    peer_cache.store(&shape, "rust question 1", None, r#"{"id":"r1","type":"message","role":"assistant","content":[{"type":"text","text":"ans1"}],"model":"x","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        "anthropic", None, Some(3600u64), true, false).await.unwrap();
+    peer_cache.store(&shape, "rust question 2", None, r#"{"id":"r2","type":"message","role":"assistant","content":[{"type":"text","text":"ans2"}],"model":"x","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        "anthropic", None, Some(3600u64), true, false).await.unwrap();
 
     let stats_before = peer_cache.stats().await.unwrap();
     assert_eq!(stats_before.total_entries, 2);

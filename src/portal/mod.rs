@@ -1,4 +1,5 @@
-use axum::{extract::State, response::{Html, IntoResponse}, Json};
+use axum::{extract::{Query, State}, response::{Html, IntoResponse}, Json};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::server::SharedState;
@@ -22,6 +23,7 @@ pub async fn handle_overview(State(state): State<SharedState>) -> impl IntoRespo
 
     Json(json!({
         "node_id":       state.node_id,
+        "is_cnc":        state.is_cnc,
         "federation": {
             "enabled":    state.federation.is_enabled(),
             "peer_count": state.federation.peer_count().await,
@@ -77,6 +79,29 @@ pub async fn handle_routing_log(State(state): State<SharedState>) -> impl IntoRe
     }
 }
 
+// ── Cache search ──────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct CacheSearchParams {
+    #[serde(default)]
+    pub q:      Option<String>,
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub limit:  Option<i64>,
+}
+
+pub async fn handle_cache_search(
+    State(state): State<SharedState>,
+    Query(params): Query<CacheSearchParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50).min(200);
+    match state.cache.search_entries(params.q.as_deref(), params.domain.as_deref(), limit).await {
+        Ok(entries) => Json(json!({ "entries": entries, "count": entries.len() })).into_response(),
+        Err(e)      => Json(json!({ "error": e.to_string() })).into_response(),
+    }
+}
+
 // ── Dashboard HTML ─────────────────────────────────────────────────────────
 
 static DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
@@ -111,6 +136,10 @@ static DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   .btn { padding:4px 10px; border-radius:4px; font-size:.75rem; cursor:pointer; border:1px solid var(--border); background:var(--bg); color:var(--text); }
   .btn:hover { border-color:var(--blue); color:var(--blue); }
   .btn-danger:hover { border-color:var(--red); color:var(--red); }
+  input[type=text] { background:var(--bg); border:1px solid var(--border); border-radius:4px; color:var(--text); padding:4px 8px; font-size:.85rem; }
+  input[type=text]:focus { outline:none; border-color:var(--blue); }
+  select { background:var(--bg); border:1px solid var(--border); border-radius:4px; color:var(--text); padding:4px 8px; font-size:.85rem; }
+  .pin-badge { display:inline-block; padding:1px 6px; border-radius:8px; font-size:.7rem; background:#1a2a3a; color:var(--blue); }
   #toast { position:fixed; bottom:24px; right:24px; padding:10px 18px; border-radius:6px; font-size:.85rem; display:none; }
   #toast.ok  { background:var(--green); color:#000; }
   #toast.err { background:var(--red);   color:#fff; }
@@ -140,8 +169,31 @@ static DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   <div id="routing-recent"></div>
 </div>
 <div class="card">
-  <div class="card-label">Shared Cache Hashes (latest 50)</div>
-  <div id="hashes" style="font-size:.7rem;color:var(--muted);margin-top:8px">loading...</div>
+  <h2>Cache Entries</h2>
+  <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+    <input type="text" id="search-q" placeholder="Search prompt text..." style="flex:1;min-width:180px">
+    <select id="search-domain">
+      <option value="">All domains</option>
+      <option value="rust">Rust</option>
+      <option value="python">Python</option>
+      <option value="typescript">TypeScript</option>
+      <option value="javascript">JavaScript</option>
+      <option value="sql">SQL</option>
+      <option value="shell">Shell</option>
+      <option value="general">General</option>
+    </select>
+    <button class="btn" onclick="searchCache()">Search</button>
+  </div>
+  <table id="cache-table">
+    <thead><tr>
+      <th>Prompt</th><th>Domain</th><th>Intent</th><th>Hits</th><th>Model</th><th>Pinned</th><th>Actions</th>
+    </tr></thead>
+    <tbody id="cache-body"><tr><td colspan="7" style="color:var(--muted)">loading...</td></tr></tbody>
+  </table>
+</div>
+<div class="card" id="endpoints-card">
+  <h2>API Endpoints</h2>
+  <div id="endpoints-list" style="font-size:.82rem;color:var(--muted)">loading...</div>
 </div>
 <div id="toast"></div>
 <script>
@@ -252,6 +304,7 @@ async function refreshRouting() {
     const total = s.total_requests || 0;
     const decs  = s.by_decision   || [];
 
+    const missReasons = s.by_miss_reason || [];
     document.getElementById('routing-breakdown').innerHTML =
       `<div style="margin-bottom:10px"><span style="color:var(--text);font-size:1rem;font-weight:600">${total}</span> requests in 24 h</div>` +
       decs.map(dec => `
@@ -263,7 +316,18 @@ async function refreshRouting() {
           <div style="width:36px;text-align:right">${dec.pct.toFixed(0)}%</div>
           <div style="width:72px;text-align:right;color:var(--muted)">${dec.avg_latency_ms.toFixed(0)} ms avg</div>
           <div style="width:64px;text-align:right;color:var(--green)">${dec.saved_usd > 0 ? '$' + dec.saved_usd.toFixed(4) : ''}</div>
-        </div>`).join('');
+        </div>`).join('') +
+      (missReasons.length ? `
+        <div style="margin-top:14px;margin-bottom:6px;font-size:.75rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">API miss reasons (24 h)</div>` +
+        missReasons.map(m => `
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;font-size:.78rem">
+            <div style="width:200px;color:var(--muted)">${m.reason}</div>
+            <div style="flex:1;background:var(--border);border-radius:3px;height:5px;overflow:hidden">
+              <div style="width:${m.pct.toFixed(1)}%;background:var(--yellow);height:100%"></div>
+            </div>
+            <div style="width:36px;text-align:right;color:var(--muted)">${m.pct.toFixed(0)}%</div>
+            <div style="width:36px;text-align:right;color:var(--muted)">${m.count}</div>
+          </div>`).join('') : '');
 
     const rows = (d.recent || []).slice(0, 25);
     if (!rows.length) {
@@ -274,13 +338,14 @@ async function refreshRouting() {
     document.getElementById('routing-recent').innerHTML = `
       <table style="margin-top:8px">
         <thead><tr>
-          <th>Time</th><th>Shape</th><th>Decision</th><th>Latency</th><th>Tokens</th><th>Saved</th>
+          <th>Time</th><th>Shape</th><th>Decision</th><th>Miss Reason</th><th>Latency</th><th>Tokens</th><th>Saved</th>
         </tr></thead>
         <tbody>
           ${rows.map(r => `<tr>
             <td style="color:var(--muted)">${timeAgo(r.created_at)}</td>
             <td style="font-size:.75rem">${r.shape_key || ''}</td>
             <td><span class="badge ${DECISION_BADGE[r.decision]||'badge-untrusted'}">${r.decision}</span></td>
+            <td style="font-size:.72rem;color:var(--muted)">${r.miss_reason || ''}</td>
             <td>${r.latency_ms} ms</td>
             <td style="color:var(--muted)">${r.tokens_in != null ? r.tokens_in : ''}</td>
             <td style="color:var(--green)">${r.saved_usd ? '$' + r.saved_usd.toFixed(4) : ''}</td>
@@ -290,10 +355,139 @@ async function refreshRouting() {
   } catch(e) { console.error(e); }
 }
 
+async function cacheAction(id, action) {
+  try {
+    let url, method, body;
+    if (action === 'delete') {
+      url = '/v1/cache/entries/' + id; method = 'DELETE'; body = null;
+    } else if (action === 'pin') {
+      url = '/v1/cache/entries/' + id + '/pin'; method = 'POST'; body = JSON.stringify({ pinned: true });
+    } else if (action === 'unpin') {
+      url = '/v1/cache/entries/' + id + '/pin'; method = 'POST'; body = JSON.stringify({ pinned: false });
+    }
+    const r = await fetch(url, { method, headers: body ? {'content-type':'application/json'} : {}, body });
+    const j = await r.json();
+    if (r.ok && j.ok) { toast(action + ' ok', true); searchCache(); }
+    else { toast(j.error || 'failed', false); }
+  } catch(e) { toast(String(e), false); }
+}
+
+async function searchCache() {
+  const q      = document.getElementById('search-q').value.trim();
+  const domain = document.getElementById('search-domain').value;
+  let url = '/api/cache/search?limit=50';
+  if (q)      url += '&q=' + encodeURIComponent(q);
+  if (domain) url += '&domain=' + encodeURIComponent(domain);
+  try {
+    const d = await fetch(url).then(r => r.json());
+    const entries = d.entries || [];
+    const tbody = document.getElementById('cache-body');
+    if (!entries.length) {
+      tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted)">no entries found</td></tr>';
+      return;
+    }
+    tbody.innerHTML = entries.map(e => {
+      const snippet = (e.prompt_preview || '').slice(0, 80) + (e.prompt_preview?.length > 80 ? '…' : '');
+      const pinBtn  = e.pinned
+        ? `<button class="btn" onclick="cacheAction('${e.id}','unpin')">Unpin</button>`
+        : `<button class="btn" onclick="cacheAction('${e.id}','pin')">Pin</button>`;
+      return `<tr>
+        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(e.prompt_preview||'').replace(/"/g,'&quot;')}">${snippet}</td>
+        <td style="font-size:.75rem">${e.domain || ''}</td>
+        <td style="font-size:.75rem">${e.intent || ''}</td>
+        <td style="text-align:right">${e.hit_count ?? 0}</td>
+        <td style="font-size:.75rem">${e.model_used || ''}</td>
+        <td>${e.pinned ? '<span class="pin-badge">pinned</span>' : ''}</td>
+        <td style="white-space:nowrap">
+          ${pinBtn}
+          <button class="btn btn-danger" onclick="cacheAction('${e.id}','delete')">Delete</button>
+        </td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+
+document.getElementById('search-q').addEventListener('keydown', e => { if (e.key === 'Enter') searchCache(); });
+
+function renderEndpoints(isCnc, fedEnabled) {
+  const base = window.location.origin;
+  const groups = [
+    {
+      label: 'Proxy',
+      rows: [
+        ['POST', '/v1/messages', 'route prompt to cache / local / API'],
+      ]
+    },
+    {
+      label: 'Health',
+      rows: [
+        ['GET', '/health', 'liveness check — returns node_id'],
+      ]
+    },
+    ...(fedEnabled ? [{
+      label: 'Federation',
+      rows: [
+        ['POST', '/v1/federation/announce',    'peer announce / bootstrap'],
+        ['GET',  '/v1/federation/peers',       'list known peers'],
+        ['GET',  '/v1/federation/lookup/:hash','semantic hash lookup'],
+        ['POST', '/v1/federation/semantic',    'semantic search across peers'],
+        ['GET',  '/v1/federation/revocations', 'pull revocation list'],
+        ['POST', '/v1/federation/revocations', 'push revocations to peer'],
+      ]
+    }] : []),
+    {
+      label: 'Portal (protected)',
+      rows: [
+        ['GET',  '/',                 'dashboard'],
+        ['GET',  '/stats',            'raw stats JSON'],
+        ['GET',  '/api/overview',     'node / budget / federation summary'],
+        ['GET',  '/api/cache',        'shared cache hashes'],
+        ['GET',  '/api/cache/search', 'search cache entries'],
+        ['GET',  '/api/spend',        'spend history'],
+        ['POST', '/api/pricing',      'update token pricing'],
+        ['GET',  '/api/trust',        'list trusted nodes'],
+        ['GET',  '/api/peers/health', 'peer health checks'],
+        ['GET',  '/api/routing',      'routing log + stats'],
+      ]
+    },
+    {
+      label: 'Cache Management (protected)',
+      rows: [
+        ['GET',    '/v1/cache/export',            'download all cache entries as JSON'],
+        ['POST',   '/v1/cache/seed',              'import / pre-warm cache entries'],
+        ['POST',   '/v1/cache/entries/:id/pin',   'pin or unpin an entry'],
+        ['DELETE', '/v1/cache/entries/:id',       'delete a cache entry'],
+      ]
+    },
+    ...(isCnc ? [{
+      label: 'Trust / Eviction (CNC only)',
+      rows: [
+        ['GET',  '/v1/trust',            'list trusted nodes'],
+        ['POST', '/v1/trust/:node_id',   'promote peer to trusted'],
+        ['POST', '/v1/evict/:node_id',   'evict peer and purge its cache'],
+      ]
+    }] : []),
+  ];
+
+  const METHOD_COLOR = { GET:'var(--blue)', POST:'var(--green)', DELETE:'var(--red)' };
+
+  document.getElementById('endpoints-list').innerHTML = groups.map(g => `
+    <div style="margin-bottom:14px">
+      <div style="font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">${g.label}</div>
+      ${g.rows.map(([m, p, desc]) => `
+        <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px;font-family:monospace">
+          <span style="color:${METHOD_COLOR[m]||'var(--muted)'};min-width:52px;font-size:.75rem;font-weight:700">${m}</span>
+          <a href="${base}${p}" target="_blank" style="color:var(--text);text-decoration:none;font-size:.8rem" onmouseover="this.style.color='var(--blue)'" onmouseout="this.style.color='var(--text)'">${p}</a>
+          <span style="color:var(--muted);font-size:.75rem">${desc}</span>
+        </div>`).join('')}
+    </div>`).join('');
+}
+
 async function refresh() {
   try {
     const ov = await fetch('/api/overview').then(r => r.json());
     document.getElementById('node-id').textContent = 'node: ' + ov.node_id;
+    renderEndpoints(ov.is_cnc, ov.federation?.enabled);
     const c  = ov.cache || {};
     const b  = ov.budget || {};
     const f  = ov.federation || {};
@@ -314,12 +508,7 @@ async function refresh() {
 
   refreshTrust();
   refreshRouting();
-
-  try {
-    const ch = await fetch('/api/cache').then(r => r.json());
-    const hashes = (ch.hashes || []).map(h => h.slice(0, 16) + '...').join('<br>');
-    document.getElementById('hashes').innerHTML = hashes || '<em>none yet</em>';
-  } catch(e) {}
+  searchCache();
 }
 refresh();
 setInterval(refresh, 30000);
