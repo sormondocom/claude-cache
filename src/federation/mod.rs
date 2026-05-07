@@ -118,20 +118,18 @@ pub struct PeerNode {
 // ── Client ─────────────────────────────────────────────────────────────────
 
 pub struct FederationClient {
-    client:     reqwest::Client,
-    peers:      Vec<PeerNode>,
-    enabled:    bool,
-    identity:   Arc<NodeIdentity>,
-    trust:      Arc<TrustStore>,
+    client:   reqwest::Client,
+    enabled:  bool,
+    identity: Arc<NodeIdentity>,
+    trust:    Arc<TrustStore>,
 }
 
 impl FederationClient {
     pub fn new(
-        peers:       Vec<PeerNode>,
-        enabled:     bool,
-        identity:    Arc<NodeIdentity>,
-        trust:       Arc<TrustStore>,
-        timeout_ms:  u64,
+        enabled:    bool,
+        identity:   Arc<NodeIdentity>,
+        trust:      Arc<TrustStore>,
+        timeout_ms: u64,
     ) -> Self {
         FederationClient {
             client: reqwest::Client::builder()
@@ -139,25 +137,32 @@ impl FederationClient {
                 .use_rustls_tls()
                 .build()
                 .expect("federation reqwest client"),
-            peers,
             enabled,
             identity,
             trust,
         }
     }
 
+    /// All trusted peers with a known URL, excluding this node.
+    /// Derives the live set from TrustStore on every call, so config-declared
+    /// peers and dynamically-promoted peers are both included.
+    async fn live_peers(&self) -> Vec<PeerNode> {
+        let own_id = &self.identity.fingerprint;
+        self.trust.list_trusted().await.unwrap_or_default()
+            .into_iter()
+            .filter(|r| !r.url.is_empty() && &r.node_id != own_id)
+            .map(|r| PeerNode { id: r.node_id, url: r.url })
+            .collect()
+    }
+
     /// Query TRUSTED, REACHABLE peers for a cache entry by SHA256 hash.
     /// Peers are sorted by average latency (fastest first) before the parallel
     /// fan-out, so the first result to resolve is most likely to be the fastest.
     pub async fn lookup(&self, hash: &str) -> Option<FederatedEntry> {
-        if !self.enabled || self.peers.is_empty() {
-            return None;
-        }
+        if !self.enabled { return None; }
 
         let peers = self.reachable_peers_sorted().await;
-        if peers.is_empty() {
-            return None;
-        }
+        if peers.is_empty() { return None; }
 
         let mut handles = Vec::new();
         for peer in peers {
@@ -167,9 +172,7 @@ impl FederationClient {
             let peer_id = peer.id.clone();
             handles.push(tokio::spawn(async move {
                 let resp = client.get(&url).send().await.ok()?;
-                if !resp.status().is_success() {
-                    return None;
-                }
+                if !resp.status().is_success() { return None; }
                 let entry: FederatedEntry = resp.json().await.ok()?;
                 let remote_key = trust.get_public_key(&entry.node_id).await.ok()??;
                 let msg = federated_entry_message(&entry);
@@ -181,9 +184,7 @@ impl FederationClient {
             }));
         }
         for handle in handles {
-            if let Ok(Some(entry)) = handle.await {
-                return Some(entry);
-            }
+            if let Ok(Some(entry)) = handle.await { return Some(entry); }
         }
         None
     }
@@ -197,14 +198,10 @@ impl FederationClient {
         sim_threshold: f64,
         limit:         usize,
     ) -> Option<(FederatedEntry, f64)> {
-        if !self.enabled || self.peers.is_empty() {
-            return None;
-        }
+        if !self.enabled { return None; }
 
         let peers = self.reachable_peers_sorted().await;
-        if peers.is_empty() {
-            return None;
-        }
+        if peers.is_empty() { return None; }
 
         let req = SemanticLookupRequest {
             domain:        domain.to_string(),
@@ -223,9 +220,7 @@ impl FederationClient {
             let body    = req_body.clone();
             handles.push(tokio::spawn(async move {
                 let resp = client.post(&url).json(&body).send().await.ok()?;
-                if !resp.status().is_success() {
-                    return None;
-                }
+                if !resp.status().is_success() { return None; }
                 let hits: Vec<SemanticFederatedEntry> = resp.json().await.ok()?;
                 let hit = hits.into_iter().next()?;
                 let remote_key = trust.get_public_key(&hit.entry.node_id).await.ok()??;
@@ -238,56 +233,46 @@ impl FederationClient {
             }));
         }
         for handle in handles {
-            if let Ok(Some(result)) = handle.await {
-                return Some(result);
-            }
+            if let Ok(Some(result)) = handle.await { return Some(result); }
         }
         None
     }
 
-    /// Announce our shared hashes to all peers.
-    /// Only sends to peers whose url we know; the peers decide whether to trust us.
+    /// Announce our shared hashes to all trusted peers.
     pub async fn announce(&self, hashes: Vec<String>, our_url: &str) {
-        if !self.enabled || self.peers.is_empty() || hashes.is_empty() {
-            return;
-        }
+        if !self.enabled || hashes.is_empty() { return; }
+        let peers = self.live_peers().await;
+        if peers.is_empty() { return; }
         let payload = AnnouncePayload::build(&self.identity, our_url, hashes);
         let body    = match serde_json::to_value(&payload) {
             Ok(v)  => v,
             Err(e) => { warn!("announce serialize error: {e}"); return; }
         };
-        for peer in &self.peers {
+        for peer in peers {
             let url    = format!("{}/v1/federation/announce", peer.url);
             let client = self.client.clone();
             let b      = body.clone();
-            tokio::spawn(async move {
-                let _ = client.post(&url).json(&b).send().await;
-            });
+            tokio::spawn(async move { let _ = client.post(&url).json(&b).send().await; });
         }
     }
 
     // ── Revocation gossip ────────────────────────────────────────────────────
 
-    /// Push a signed revocation to all currently trusted peers (fire-and-forget).
+    /// Push a signed revocation to all trusted peers (fire-and-forget).
     /// Called immediately after a local eviction so the mesh learns fast.
     pub async fn push_revocation_to_peers(&self, rev: &RevocationRecord) {
-        if !self.enabled || self.peers.is_empty() {
-            return;
-        }
+        if !self.enabled { return; }
+        let peers = self.live_peers().await;
+        if peers.is_empty() { return; }
         let body = match serde_json::to_value(rev) {
             Ok(v)  => v,
             Err(e) => { warn!("revocation serialize error: {e}"); return; }
         };
-        for peer in &self.peers {
-            if !self.trust.is_trusted(&peer.id).await {
-                continue; // only push to peers we trust
-            }
+        for peer in peers {
             let url    = format!("{}/v1/federation/revocations", peer.url);
             let client = self.client.clone();
             let b      = body.clone();
-            tokio::spawn(async move {
-                let _ = client.post(&url).json(&b).send().await;
-            });
+            tokio::spawn(async move { let _ = client.post(&url).json(&b).send().await; });
         }
     }
 
@@ -322,32 +307,30 @@ impl FederationClient {
 
     /// Pull revocations from all trusted peers.  Called hourly and on startup.
     pub async fn sync_revocations(&self, cache: &CacheStore) -> usize {
-        if !self.enabled || self.peers.is_empty() {
-            return 0;
-        }
+        if !self.enabled { return 0; }
+        let peers = self.live_peers().await;
         let mut total = 0usize;
-        for peer in &self.peers {
-            if self.trust.is_trusted(&peer.id).await {
-                total += self.pull_revocations_from_url(&peer.url, cache).await;
-            }
+        for peer in peers {
+            total += self.pull_revocations_from_url(&peer.url, cache).await;
         }
         total
     }
 
-    /// Return the subset of configured peers that are currently trusted AND
-    /// reachable, sorted by average health-check latency (fastest first).
-    /// Peers with no health data are included (given benefit of the doubt) and
-    /// placed after peers with known-good latency.
+    /// Return the live peers that are currently reachable, sorted by average
+    /// health-check latency (fastest first).  Peers with no health data are
+    /// included (benefit of the doubt) and placed after peers with known-good
+    /// latency.
     async fn reachable_peers_sorted(&self) -> Vec<PeerNode> {
+        let peers  = self.live_peers().await;
         let health = self.trust.list_peer_health().await.unwrap_or_default();
 
-        // Build a latency map: node_id → avg_latency_ms (None = unknown)
+        // Build a latency map: node_id → avg_latency_ms (None = unreachable)
         let lat: std::collections::HashMap<&str, Option<f64>> = health
             .iter()
             .map(|h| (h.node_id.as_str(), if h.is_reachable { h.avg_latency_ms } else { None }))
             .collect();
 
-        let mut peers: Vec<&PeerNode> = self.peers.iter()
+        let mut filtered: Vec<PeerNode> = peers.into_iter()
             .filter(|p| {
                 // Skip peers the health checker has marked unreachable.
                 // Peers with no health record are included.
@@ -356,17 +339,18 @@ impl FederationClient {
             .collect();
 
         // Fastest known peers first; unknown-latency peers at the end.
-        peers.sort_by(|a, b| {
+        filtered.sort_by(|a, b| {
             let la = lat.get(a.id.as_str()).and_then(|v| *v).unwrap_or(f64::MAX);
             let lb = lat.get(b.id.as_str()).and_then(|v| *v).unwrap_or(f64::MAX);
             la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        peers.into_iter().cloned().collect()
+        filtered
     }
 
-    pub fn peer_count(&self) -> usize {
-        self.peers.len()
+    /// Count of currently trusted peers (excludes self, requires a non-empty URL).
+    pub async fn peer_count(&self) -> usize {
+        self.live_peers().await.len()
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -399,9 +383,3 @@ pub fn federated_entry_message(fe: &FederatedEntry) -> Vec<u8> {
     format!("{}|{}|{}", fe.hash, fe.node_id, resp_hash).into_bytes()
 }
 
-/// Build a PeerNode list from typed peer configs.
-pub fn peers_from_config(peers: &[crate::config::PeerConfig]) -> Vec<PeerNode> {
-    peers.iter()
-        .map(|p| PeerNode { id: p.node_id.clone(), url: p.url.clone() })
-        .collect()
-}

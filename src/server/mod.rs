@@ -7,6 +7,8 @@ use axum::{
     routing::{get, post},
     Json, Router as AxumRouter,
 };
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use std::num::NonZeroU32;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -43,6 +45,8 @@ pub struct AppState {
     /// Static bearer token for the management portal.  `None` = auth disabled.
     /// Set via `CLAUDE_CACHE_PORTAL_TOKEN` env var — never stored in config files.
     pub portal_token:     Option<String>,
+    /// Messages-per-minute rate limit applied to POST /v1/messages.  0 = disabled.
+    pub rate_limit_rpm:   u32,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -93,10 +97,36 @@ pub fn build_router(state: SharedState) -> AxumRouter {
         .route("/api/routing",      get(crate::portal::handle_routing_log))
         .layer(middleware::from_fn_with_state(state.clone(), require_portal_token));
 
-    // Public routes: the proxy endpoint, health check, and federation peer
-    // endpoints (which have their own Ed25519-based authentication).
+    // Rate limiter for /v1/messages — None when rate_limit_rpm == 0 (disabled).
+    let messages_limiter: Option<Arc<DefaultDirectRateLimiter>> =
+        NonZeroU32::new(state.rate_limit_rpm)
+            .map(|rpm| Arc::new(RateLimiter::direct(Quota::per_minute(rpm))));
+
+    // /v1/messages with optional rate-limiting middleware applied only to this route.
+    let messages_router = {
+        let lim = messages_limiter;
+        AxumRouter::new()
+            .route("/v1/messages", post(handle_messages))
+            .layer(middleware::from_fn(move |req: axum::extract::Request, next: middleware::Next| {
+                let lim = lim.clone();
+                async move {
+                    if let Some(ref limiter) = lim {
+                        if limiter.check().is_err() {
+                            return (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                [(axum::http::header::RETRY_AFTER, "2")],
+                                Json(json!({"error": "rate limit exceeded", "limit": "messages_per_minute"})),
+                            ).into_response();
+                        }
+                    }
+                    next.run(req).await
+                }
+            }))
+    };
+
+    // Remaining public routes: health check and federation peer endpoints
+    // (federation uses Ed25519-based authentication, not portal token).
     let public = AxumRouter::new()
-        .route("/v1/messages",               post(handle_messages))
         .route("/health",                    get(handle_health))
         .route("/v1/federation/lookup/:hash", get(handle_federation_lookup))
         .route("/v1/federation/announce",    post(handle_federation_announce))
@@ -107,6 +137,7 @@ pub fn build_router(state: SharedState) -> AxumRouter {
         .fallback(handle_passthrough);
 
     AxumRouter::new()
+        .merge(messages_router)
         .merge(public)
         .merge(protected)
         .with_state(state)
@@ -257,7 +288,7 @@ async fn handle_health(State(state): State<SharedState>) -> Json<Value> {
         "status": "ok",
         "node_id": state.node_id,
         "cache_entries": stats.total_entries,
-        "federation_peers": state.federation.peer_count(),
+        "federation_peers": state.federation.peer_count().await,
     }))
 }
 
@@ -453,7 +484,7 @@ async fn handle_federation_peers(State(state): State<SharedState>) -> Json<Value
         "node_id":       state.identity.fingerprint,
         "public_key":    state.identity.public_key_hex,
         "is_cnc":        state.is_cnc,
-        "peer_count":    state.federation.peer_count(),
+        "peer_count":    state.federation.peer_count().await,
         "enabled":       state.federation.is_enabled(),
         "trusted_peers": trusted.len(),
     }))

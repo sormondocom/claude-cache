@@ -11,7 +11,7 @@ use claude_cache::{
     cache::CacheStore,
     config::{AppConfig, NodeRole},
     embedding::{Embedder, OllamaEmbedder, StubEmbedder},
-    federation::{AnnouncePayload, FederationClient, peers_from_config},
+    federation::{AnnouncePayload, FederationClient},
     health,
     identity::NodeIdentity,
     router::Router,
@@ -211,9 +211,7 @@ async fn run_server(
     let api_backend:   Arc<dyn ModelBackend> = anthropic.clone();
 
     // ── Federation ────────────────────────────────────────────────────────
-    let peers      = peers_from_config(&cfg.federation.peers);
     let federation = Arc::new(FederationClient::new(
-        peers,
         cfg.federation.enabled,
         identity.clone(),
         trust.clone(),
@@ -302,15 +300,21 @@ async fn run_server(
 
     // ── Background: eviction + gossip + revocation sync ───────────────────
     {
-        let evict_cache = cache.clone();
-        let fed         = federation.clone();
-        let bg_url      = our_url.clone();
+        let evict_cache  = cache.clone();
+        let fed          = federation.clone();
+        let bg_url       = our_url.clone();
+        let max_size_bytes = cfg.cache.max_size_mb * 1024 * 1024;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
                 if let Ok(n) = evict_cache.evict_expired().await {
                     if n > 0 { info!("evicted {n} expired cache entries"); }
+                }
+                match evict_cache.evict_to_size_limit(max_size_bytes).await {
+                    Ok(n) if n > 0 => info!("size-limit eviction: removed {n} LRU entries"),
+                    Err(e)         => tracing::warn!("size-limit eviction error: {e}"),
+                    _              => {}
                 }
                 if let Ok(hashes) = evict_cache.list_shared_hashes(500, 0).await {
                     fed.announce(hashes, &bg_url).await;
@@ -342,10 +346,11 @@ async fn run_server(
         anthropic,
         node_id,
         is_cnc,
-        auto_promote_peers: cfg.node.auto_promote_peers,
-        api_base_url: cfg.api.base_url.clone(),
-        api_creds:    creds,
+        auto_promote_peers:  cfg.node.auto_promote_peers,
+        api_base_url:        cfg.api.base_url.clone(),
+        api_creds:           creds,
         portal_token,
+        rate_limit_rpm:      cfg.limits.messages_per_minute,
     });
 
     let app      = build_router(state);
@@ -358,7 +363,46 @@ async fn run_server(
         info!("CNC trust:  POST http://{addr}/v1/trust/:node_id");
         info!("CNC evict:  POST http://{addr}/v1/evict/:node_id");
     }
+    if cfg.limits.messages_per_minute > 0 {
+        info!("rate limit: {} req/min on POST /v1/messages", cfg.limits.messages_per_minute);
+    }
 
-    axum::serve(listener, app).await?;
+    let drain_timeout = std::time::Duration::from_secs(cfg.limits.shutdown_timeout_secs);
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal());
+
+    // Race the graceful drain against the configured timeout so a stuck
+    // in-flight request can't hold the process open indefinitely.
+    tokio::select! {
+        result = server => { result?; }
+        _ = tokio::time::sleep(drain_timeout) => {
+            tracing::warn!("graceful-shutdown drain timeout ({}s) exceeded; forcing exit",
+                drain_timeout.as_secs());
+        }
+    }
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c    => { tracing::info!("received Ctrl+C — stopping"); }
+        _ = terminate => { tracing::info!("received SIGTERM — stopping"); }
+    }
 }

@@ -24,7 +24,7 @@ pub async fn handle_overview(State(state): State<SharedState>) -> impl IntoRespo
         "node_id":       state.node_id,
         "federation": {
             "enabled":    state.federation.is_enabled(),
-            "peer_count": state.federation.peer_count(),
+            "peer_count": state.federation.peer_count().await,
         },
         "cache": cache_stats.map(|s| json!({
             "total_entries":  s.total_entries,

@@ -61,6 +61,7 @@ pub struct RoutingLogEntry {
 pub struct CacheStore {
     pool:    SqlitePool,
     node_id: String,
+    db_path: String,
 }
 
 impl CacheStore {
@@ -74,7 +75,7 @@ impl CacheStore {
             .connect_with(opts)
             .await?;
 
-        let store = CacheStore { pool, node_id: node_id.to_string() };
+        let store = CacheStore { pool, node_id: node_id.to_string(), db_path: db_path.to_string() };
         store.migrate().await?;
         Ok(store)
     }
@@ -327,12 +328,50 @@ impl CacheStore {
         let shared: i64 = sqlx::query("SELECT COUNT(*) as c FROM cache_entries WHERE shared = 1")
             .fetch_one(&self.pool).await?.get("c");
 
+        // Actual DB file size + WAL file size (if present).
+        let db_bytes  = std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0) as i64;
+        let wal_bytes = std::fs::metadata(format!("{}-wal", self.db_path)).map(|m| m.len()).unwrap_or(0) as i64;
+
         Ok(CacheStats {
             total_entries:  total,
             total_hits:     hits,
             shared_entries: shared,
-            db_size_bytes:  0, // filled by portal if needed
+            db_size_bytes:  db_bytes + wal_bytes,
         })
+    }
+
+    /// Evict the least-recently-used cache entries until the live database
+    /// size (page_count − freelist_count) × page_size is at or below
+    /// `max_bytes`.  Embeddings are removed automatically via ON DELETE CASCADE.
+    /// Returns the number of rows deleted.
+    pub async fn evict_to_size_limit(&self, max_bytes: u64) -> Result<u64> {
+        let mut total_evicted = 0u64;
+        for _ in 0..200 {
+            // (page_count - freelist_count) × page_size reflects freed pages
+            // immediately after DELETE, even in WAL mode.
+            let row = sqlx::query(
+                "SELECT (page_count - freelist_count) * page_size AS live \
+                 FROM pragma_page_count(), pragma_freelist_count(), pragma_page_size()"
+            ).fetch_one(&self.pool).await?;
+            let live_bytes: i64 = row.get("live");
+            if (live_bytes as u64) <= max_bytes {
+                break;
+            }
+
+            let r = sqlx::query(
+                "DELETE FROM cache_entries WHERE id IN (
+                     SELECT id FROM cache_entries
+                     ORDER BY COALESCE(last_hit_at, created_at) ASC
+                     LIMIT 100
+                 )"
+            ).execute(&self.pool).await?;
+            let deleted = r.rows_affected();
+            if deleted == 0 {
+                break;
+            }
+            total_evicted += deleted;
+        }
+        Ok(total_evicted)
     }
 
     pub async fn log_routing(

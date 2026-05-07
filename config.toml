@@ -79,6 +79,15 @@ enabled        = false
 share_cache    = false
 lookup_timeout_ms = 500
 
+# ── Rate limits & graceful shutdown ──────────────────────────────────────────
+# messages_per_minute: cap on POST /v1/messages.  0 = disabled (not recommended
+#                      for shared deployments).  Returns HTTP 429 when exceeded.
+# shutdown_timeout_secs: how long to wait for in-flight requests to drain when
+#                        a SIGTERM/Ctrl+C is received before forcing exit.
+[limits]
+messages_per_minute   = 30000
+shutdown_timeout_secs = 30
+
 # ── Peer health checks ────────────────────────────────────────────────────────
 # Health checks are only active when federation.enabled = true.
 # interval_secs: how often to probe each trusted peer's /health endpoint.

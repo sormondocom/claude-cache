@@ -60,6 +60,7 @@ struct ServerParams {
     local_confidence:  f64,
     confidence_floor:  f64,
     portal_token:      Option<String>,
+    rate_limit_rpm:    u32,
 }
 
 impl ServerParams {
@@ -70,6 +71,7 @@ impl ServerParams {
             local_confidence: 0.9,
             confidence_floor: 0.5,
             portal_token:     None,
+            rate_limit_rpm:   0, // no limit in tests
         }
     }
 
@@ -80,6 +82,7 @@ impl ServerParams {
             local_confidence: 0.9,
             confidence_floor: 0.5,
             portal_token:     None,
+            rate_limit_rpm:   0,
         }
     }
 }
@@ -121,7 +124,7 @@ async fn start_server(p: ServerParams) -> (String, tempfile::TempDir) {
     );
 
     let federation = Arc::new(FederationClient::new(
-        vec![], false, identity.clone(), trust.clone(), 500,
+        false, identity.clone(), trust.clone(), 500,
     ));
 
     // AnthropicBackend is only used for streaming passthrough; point it at
@@ -148,6 +151,7 @@ async fn start_server(p: ServerParams) -> (String, tempfile::TempDir) {
         api_base_url:       "http://127.0.0.1:1".to_string(),
         api_creds:          dummy_creds,
         portal_token:       p.portal_token,
+        rate_limit_rpm:     p.rate_limit_rpm,
     });
 
     let app      = build_router(state);
@@ -287,6 +291,7 @@ async fn budget_exceeded_blocks_api_call() {
         local_confidence: 0.3,  // below floor
         confidence_floor: 0.5,
         portal_token:     None,
+        rate_limit_rpm:   0,
     }).await;
 
     let client = reqwest::Client::new();
@@ -452,4 +457,28 @@ async fn portal_auth_does_not_block_messages_or_health() {
         .json(&user_msg("auth bypass check"))
         .send().await.unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn rate_limit_returns_429_when_exceeded() {
+    // Set an extremely low limit (1 req/min) so the second request is guaranteed
+    // to hit the limiter.
+    let (base, _dir) = start_server(ServerParams {
+        rate_limit_rpm: 1,
+        ..ServerParams::force_api(10.0)
+    }).await;
+
+    let client = reqwest::Client::new();
+    let msg = user_msg("rate limit test");
+
+    // First request must pass.
+    let first = client.post(format!("{base}/v1/messages")).json(&msg).send().await.unwrap();
+    assert_eq!(first.status(), 200, "first request should succeed");
+
+    // Second request must be rejected.
+    let second = client.post(format!("{base}/v1/messages")).json(&msg).send().await.unwrap();
+    assert_eq!(second.status(), 429, "second request should be rate-limited");
+
+    let body: Value = second.json().await.unwrap();
+    assert!(body["error"].as_str().is_some(), "429 body must contain error field");
 }

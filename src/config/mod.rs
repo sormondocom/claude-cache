@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub node:       NodeConfig,
     #[serde(default)]
     pub health:     HealthConfig,
+    #[serde(default)]
+    pub limits:     LimitsConfig,
 }
 
 // ── Server ──────────────────────────────────────────────────────────────────
@@ -123,6 +125,26 @@ impl Default for HealthConfig {
             interval_secs:     60,
             timeout_ms:        2000,
             failure_threshold: 3,
+        }
+    }
+}
+
+// ── Limits ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// Maximum requests to POST /v1/messages per minute.  0 = no limit.
+    pub messages_per_minute: u32,
+    /// Seconds to wait for in-flight requests to drain during graceful shutdown.
+    pub shutdown_timeout_secs: u64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        LimitsConfig {
+            messages_per_minute:   30_000,
+            shutdown_timeout_secs: 30,
         }
     }
 }
@@ -258,6 +280,7 @@ impl Default for AppConfig {
             },
             node:   NodeConfig::default(),
             health: HealthConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
