@@ -64,6 +64,8 @@ pub struct CacheEntrySummary {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RoutingLogEntry {
     pub shape_key:   String,
+    pub domain:      Option<String>,
+    pub intent:      Option<String>,
     pub decision:    String,
     pub backend:     String,
     pub latency_ms:  i64,
@@ -152,6 +154,8 @@ impl CacheStore {
             CREATE TABLE IF NOT EXISTS routing_log (
                 id          TEXT    PRIMARY KEY,
                 shape_key   TEXT    NOT NULL,
+                domain      TEXT,
+                intent      TEXT,
                 decision    TEXT    NOT NULL,
                 backend     TEXT    NOT NULL,
                 latency_ms  INTEGER NOT NULL,
@@ -175,6 +179,10 @@ impl CacheStore {
         let _ = sqlx::query("ALTER TABLE cache_entries ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
             .execute(&self.pool).await;
         let _ = sqlx::query("ALTER TABLE routing_log ADD COLUMN miss_reason TEXT")
+            .execute(&self.pool).await;
+        let _ = sqlx::query("ALTER TABLE routing_log ADD COLUMN domain TEXT")
+            .execute(&self.pool).await;
+        let _ = sqlx::query("ALTER TABLE routing_log ADD COLUMN intent TEXT")
             .execute(&self.pool).await;
 
         Ok(())
@@ -532,6 +540,8 @@ impl CacheStore {
     pub async fn log_routing(
         &self,
         shape_key:   &str,
+        domain:      &str,
+        intent:      &str,
         decision:    &str,
         backend:     &str,
         latency_ms:  i64,
@@ -543,12 +553,15 @@ impl CacheStore {
         let id  = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().timestamp();
         sqlx::query(
-            "INSERT INTO routing_log (id, shape_key, decision, backend, latency_ms,
-                                      tokens_in, tokens_out, saved_usd, miss_reason, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO routing_log (id, shape_key, domain, intent, decision, backend,
+                                      latency_ms, tokens_in, tokens_out, saved_usd,
+                                      miss_reason, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&id)
         .bind(shape_key)
+        .bind(domain)
+        .bind(intent)
         .bind(decision)
         .bind(backend)
         .bind(latency_ms)
@@ -571,8 +584,11 @@ impl CacheStore {
     }
 
     pub async fn domain_hit_count(&self, domain: &str, intent: &str) -> Result<i64> {
-        let now = Utc::now().timestamp();
-        let total: i64 = sqlx::query(
+        let now       = Utc::now().timestamp();
+        let thirty_days_ago = now - 2_592_000; // 30 days
+
+        // Part A: active cache entries still within TTL
+        let cache_hits: i64 = sqlx::query(
             "SELECT COALESCE(SUM(hit_count), 0) AS total \
              FROM cache_entries \
              WHERE domain = ? AND intent = ? \
@@ -584,13 +600,29 @@ impl CacheStore {
         .fetch_one(&self.pool)
         .await?
         .get("total");
-        Ok(total)
+
+        // Part B: routing_log history — successful local/cache decisions survive expiry
+        let log_hits: i64 = sqlx::query(
+            "SELECT COUNT(*) AS total \
+             FROM routing_log \
+             WHERE domain = ? AND intent = ? \
+               AND decision IN ('exact_cache','semantic_cache','local','federation') \
+               AND created_at > ?"
+        )
+        .bind(domain)
+        .bind(intent)
+        .bind(thirty_days_ago)
+        .fetch_one(&self.pool)
+        .await?
+        .get("total");
+
+        Ok(cache_hits + log_hits)
     }
 
     pub async fn routing_log_recent(&self, limit: i64) -> Result<Vec<RoutingLogEntry>> {
         let rows = sqlx::query(
-            "SELECT shape_key, decision, backend, latency_ms, tokens_in, saved_usd,
-                    miss_reason, created_at
+            "SELECT shape_key, domain, intent, decision, backend, latency_ms, tokens_in,
+                    saved_usd, miss_reason, created_at
              FROM routing_log ORDER BY created_at DESC LIMIT ?"
         )
         .bind(limit)
@@ -599,6 +631,8 @@ impl CacheStore {
 
         Ok(rows.into_iter().map(|r| RoutingLogEntry {
             shape_key:   r.get("shape_key"),
+            domain:      r.get("domain"),
+            intent:      r.get("intent"),
             decision:    r.get("decision"),
             backend:     r.get("backend"),
             latency_ms:  r.get("latency_ms"),

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -44,7 +45,7 @@ pub struct RoutedResponse {
 
 #[derive(Clone)]
 pub struct Router {
-    cfg:        Arc<AppConfig>,
+    cfg:        Arc<ArcSwap<AppConfig>>,
     cache:      Arc<CacheStore>,
     budget:     Arc<BudgetLedger>,
     embedder:   Arc<dyn Embedder>,
@@ -55,7 +56,7 @@ pub struct Router {
 
 impl Router {
     pub fn new(
-        cfg:      Arc<AppConfig>,
+        cfg:      Arc<ArcSwap<AppConfig>>,
         cache:    Arc<CacheStore>,
         budget:   Arc<BudgetLedger>,
         embedder: Arc<dyn Embedder>,
@@ -74,13 +75,14 @@ impl Router {
     pub async fn route(&self, req: &MessagesRequest) -> Result<RoutedResponse> {
         let start   = Instant::now();
         let prompt  = req.prompt_text();
+        let cfg     = self.cfg.load();
 
         // ── Step 0: tool-use fast-path ────────────────────────────────────
         // Tools require live API semantics; never route locally.
         if req.has_tools() {
             debug!("tool-use fast-path → api");
             return self.call_api_and_cache(req, &domain::classify(&prompt),
-                &policy::infer(&domain::classify(&prompt), &prompt, &self.cfg),
+                &policy::infer(&domain::classify(&prompt), &prompt, &cfg),
                 start, Some("tool_use")).await;
         }
 
@@ -89,7 +91,7 @@ impl Router {
         debug!("classified: {}", shape.display());
 
         // ── Step 2: Policy ───────────────────────────────────────────────
-        let pol = policy::infer(&shape, &prompt, &self.cfg);
+        let pol = policy::infer(&shape, &prompt, &cfg);
         if pol.bypass_cache {
             debug!("policy bypass → api");
             return self.call_api_and_cache(req, &shape, &pol, start, Some("policy_bypass")).await;
@@ -119,7 +121,7 @@ impl Router {
                 let resp: MessagesResponse = serde_json::from_str(&fed_entry.response)?;
                 let latency_ms = start.elapsed().as_millis() as u64;
                 let saved = estimate_api_cost(&self.budget, req).await;
-                let pol = policy::infer(&shape, &prompt, &self.cfg);
+                let pol = policy::infer(&shape, &prompt, &cfg);
                 if pol.should_cache() {
                     let _ = self.cache.store(&shape, &prompt, req.normalized_system().as_deref(),
                         &fed_entry.response, "federated", None, pol.ttl_secs, false, false).await;
@@ -136,7 +138,7 @@ impl Router {
         }
 
         // ── Step 4: Embedding (computed once, used for local + federation) ─
-        let embedding = if self.cfg.embedding.enabled {
+        let embedding = if cfg.embedding.enabled {
             match self.embedder.embed(&prompt).await {
                 Ok(emb) => Some(emb),
                 Err(e)  => { warn!("embedding failed, skipping semantic lookups: {e}"); None }
@@ -151,7 +153,7 @@ impl Router {
         let mut best_semantic_sim: Option<f64> = None;
         if let Some(ref emb) = embedding {
             let hits = self.cache.lookup_semantic(
-                &shape.domain, emb, self.cfg.embedding.sim_threshold, 1,
+                &shape.domain, emb, cfg.embedding.sim_threshold, 1,
             ).await?;
             if let Some((entry, sim)) = hits.into_iter().next() {
                 info!("semantic cache hit (sim={sim:.3}): {}", &entry.id[..8]);
@@ -175,7 +177,7 @@ impl Router {
         // Ask trusted peers for semantically similar entries using our embedding.
         if let (Some(ref fed), Some(ref emb)) = (&self.federation, &embedding) {
             if let Some((fed_entry, sim)) = fed.lookup_semantic(
-                emb, &shape.domain, self.cfg.embedding.sim_threshold, 1,
+                emb, &shape.domain, cfg.embedding.sim_threshold, 1,
             ).await {
                 info!("federation semantic hit (sim={sim:.3}) from {}",
                     &fed_entry.node_id[..16.min(fed_entry.node_id.len())]);
@@ -183,7 +185,7 @@ impl Router {
                 let latency_ms = start.elapsed().as_millis() as u64;
                 let saved = estimate_api_cost(&self.budget, req).await;
                 // Cache locally so future identical prompts skip the peer call.
-                let pol = policy::infer(&shape, &prompt, &self.cfg);
+                let pol = policy::infer(&shape, &prompt, &cfg);
                 if pol.should_cache() {
                     if let Ok(cid) = self.cache.store(&shape, &prompt, req.normalized_system().as_deref(),
                             &fed_entry.response, "federated", None, pol.ttl_secs, false, false).await {
@@ -211,7 +213,7 @@ impl Router {
         let score = scoring::score_prompt(&shape, &prompt, hit_count, best_semantic_sim);
         debug!("routing score: {}", score.display());
 
-        let r = &self.cfg.routing;
+        let r = &cfg.routing;
         if !score.should_use_local(r.novelty_threshold, r.complexity_threshold, r.consequence_threshold) {
             let miss = score.gate_miss_reason(r.novelty_threshold, r.complexity_threshold, r.consequence_threshold);
             debug!("routing gate → api ({}) miss={miss}", score.display());
@@ -225,7 +227,7 @@ impl Router {
         }
 
         // ── Step 7: Local model ───────────────────────────────────────────
-        if self.cfg.local.enabled {
+        if cfg.local.enabled {
             match self.try_local(req, &shape, &pol, start).await {
                 Ok(Some(routed)) => return Ok(routed),
                 Ok(None) if budget_exceeded => {
@@ -258,10 +260,11 @@ impl Router {
         pol:   &policy::CachePolicy,
         start: Instant,
     ) -> Result<Option<RoutedResponse>> {
+        let cfg    = self.cfg.load();
         let result = self.local.complete(req).await?;
         let conf   = result.confidence.unwrap_or(0.0);
 
-        if conf < self.cfg.local.confidence_floor {
+        if conf < cfg.local.confidence_floor {
             return Ok(None);
         }
 
@@ -280,12 +283,12 @@ impl Router {
                 "ollama",
                 result.confidence,
                 pol.ttl_secs,
-                pol.shareable && self.cfg.federation.share_cache,
+                pol.shareable && cfg.federation.share_cache,
                 false,
             ).await?;
 
             // Store embedding if enabled
-            if self.cfg.embedding.enabled {
+            if cfg.embedding.enabled {
                 if let Ok(emb) = self.embedder.embed(&req.prompt_text()).await {
                     let _ = self.cache.store_embedding(&cache_id, &emb, self.embedder.model()).await;
                 }
@@ -311,6 +314,7 @@ impl Router {
         start:       Instant,
         miss_reason: Option<&str>,
     ) -> Result<RoutedResponse> {
+        let cfg        = self.cfg.load();
         let result     = self.api.complete(req).await?;
         let latency_ms = start.elapsed().as_millis() as u64;
         self.record_spend(&result, req).await;
@@ -325,11 +329,11 @@ impl Router {
                 "anthropic",
                 None,
                 pol.ttl_secs,
-                pol.shareable && self.cfg.federation.share_cache,
+                pol.shareable && cfg.federation.share_cache,
                 false,
             ).await?;
 
-            if self.cfg.embedding.enabled {
+            if cfg.embedding.enabled {
                 if let Ok(emb) = self.embedder.embed(&req.prompt_text()).await {
                     let _ = self.cache.store_embedding(&cache_id, &emb, self.embedder.model()).await;
                 }
@@ -367,6 +371,8 @@ impl Router {
         let tin = req.estimated_input_tokens() as i64;
         let _ = self.cache.log_routing(
             &shape.display(),
+            &shape.domain,
+            &shape.intent,
             decision.as_str(),
             backend,
             latency_ms as i64,
@@ -390,8 +396,10 @@ impl Router {
     ) {
         use crate::backend::{ContentBlock, MessagesResponse, Usage};
 
+        let cfg = self.cfg.load();
+
         // Always record spend — streaming bypasses the sync budget path entirely.
-        let _ = self.budget.record(&self.cfg.api.model, input_tokens, output_tokens).await;
+        let _ = self.budget.record(&cfg.api.model, input_tokens, output_tokens).await;
 
         if req.has_tools() || text.is_empty() {
             return;
@@ -399,7 +407,7 @@ impl Router {
 
         let prompt = req.prompt_text();
         let shape  = domain::classify(&prompt);
-        let pol    = policy::infer(&shape, &prompt, &self.cfg);
+        let pol    = policy::infer(&shape, &prompt, &cfg);
 
         if pol.bypass_cache || !pol.should_cache() {
             return;
@@ -415,8 +423,8 @@ impl Router {
             id,
             kind:        "message".to_string(),
             role:        "assistant".to_string(),
-            content:     vec![ContentBlock { kind: "text".to_string(), text: Some(text.to_string()) }],
-            model:       self.cfg.api.model.clone(),
+            content:     vec![ContentBlock { kind: "text".to_string(), text: Some(text.to_string()), extra: Default::default() }],
+            model:       cfg.api.model.clone(),
             stop_reason: Some("end_turn".to_string()),
             usage:       Usage { input_tokens, output_tokens },
         };
@@ -426,11 +434,11 @@ impl Router {
             Err(e) => { warn!("stream cache serialize: {e}"); return; }
         };
 
-        let shareable = pol.shareable && self.cfg.federation.share_cache;
+        let shareable = pol.shareable && cfg.federation.share_cache;
         match self.cache.store(&shape, &prompt, req.normalized_system().as_deref(), &resp_json, "anthropic", None, pol.ttl_secs, shareable, false).await {
             Ok(cache_id) => {
                 info!("stream cached: {} ({output_tokens} output tokens)", &cache_id[..8]);
-                if self.cfg.embedding.enabled {
+                if cfg.embedding.enabled {
                     if let Ok(emb) = self.embedder.embed(&prompt).await {
                         let _ = self.cache.store_embedding(&cache_id, &emb, self.embedder.model()).await;
                     }

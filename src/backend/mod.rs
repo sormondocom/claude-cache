@@ -29,6 +29,10 @@ pub struct ContentBlock {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Preserves all other block fields (e.g. `thinking`, `data`, `signature`)
+    /// so thinking blocks round-trip intact through the proxy.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The full /v1/messages request body — we preserve unknown fields for passthrough.
@@ -45,6 +49,10 @@ pub struct MessagesRequest {
     pub tools:      Option<serde_json::Value>,
     #[serde(flatten)]
     pub extra:      serde_json::Map<String, serde_json::Value>,
+    /// Carried from the incoming `anthropic-beta` HTTP header — not part of the JSON body.
+    /// Forwarded to Anthropic so beta features (e.g. context_management) are accepted.
+    #[serde(skip)]
+    pub anthropic_beta: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -61,6 +61,11 @@ pub struct AnnouncePayload {
     pub hashes:        Vec<String>,
     /// Ed25519 signature over `announce_message(node_id, url, public_key_hex, hashes)`
     pub signature:     String,
+    /// Optional gossip: trusted peers we know about, forwarded so the recipient
+    /// can discover the mesh without static config.  Not covered by the signature
+    /// (advisory only — recipients validate each entry independently).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_peers: Option<Vec<PeerDescriptor>>,
 }
 
 impl AnnouncePayload {
@@ -75,6 +80,7 @@ impl AnnouncePayload {
             counter_signature: None,
             hashes,
             signature:        sig,
+            known_peers:      None,
         }
     }
 
@@ -113,6 +119,16 @@ pub struct LookupResponse {
 pub struct PeerNode {
     pub id:  String,
     pub url: String,
+}
+
+/// Minimal peer advertisement used for gossip discovery.
+/// Carried in AnnouncePayload.known_peers and returned by
+/// GET /v1/federation/peers/list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerDescriptor {
+    pub node_id:        String,
+    pub url:            String,
+    pub public_key_hex: String,
 }
 
 // ── Client ─────────────────────────────────────────────────────────────────
@@ -239,12 +255,30 @@ impl FederationClient {
     }
 
     /// Announce our shared hashes to all trusted peers.
+    /// Piggybacks our trusted peer list for gossip-based discovery.
     pub async fn announce(&self, hashes: Vec<String>, our_url: &str) {
         if !self.enabled || hashes.is_empty() { return; }
         let peers = self.live_peers().await;
         if peers.is_empty() { return; }
-        let payload = AnnouncePayload::build(&self.identity, our_url, hashes);
-        let body    = match serde_json::to_value(&payload) {
+
+        // Build gossip peer list: our trusted peers (excluding self).
+        let gossip_peers: Vec<PeerDescriptor> = self.trust
+            .list_trusted().await.unwrap_or_default()
+            .into_iter()
+            .filter(|r| !r.url.is_empty() && r.node_id != self.identity.fingerprint)
+            .map(|r| PeerDescriptor {
+                node_id:        r.node_id,
+                url:            r.url,
+                public_key_hex: r.public_key_hex,
+            })
+            .collect();
+
+        let mut payload = AnnouncePayload::build(&self.identity, our_url, hashes);
+        if !gossip_peers.is_empty() {
+            payload.known_peers = Some(gossip_peers);
+        }
+
+        let body = match serde_json::to_value(&payload) {
             Ok(v)  => v,
             Err(e) => { warn!("announce serialize error: {e}"); return; }
         };
@@ -253,6 +287,32 @@ impl FederationClient {
             let client = self.client.clone();
             let b      = body.clone();
             tokio::spawn(async move { let _ = client.post(&url).json(&b).send().await; });
+        }
+    }
+
+    /// Pull the trusted peer list from a single peer URL and register any
+    /// unknown non-evicted peers so the mesh can be discovered transitively.
+    /// Called at startup (against each config peer) and during hourly sync.
+    pub async fn exchange_peers(&self, peer_url: &str) {
+        if !self.enabled { return; }
+        let url = format!("{}/v1/federation/peers/list", peer_url.trim_end_matches('/'));
+        let peers: Vec<PeerDescriptor> = match self.client.get(&url).send().await {
+            Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+            _ => return,
+        };
+        let own_id = &self.identity.fingerprint;
+        let mut registered = 0usize;
+        for p in peers {
+            if p.node_id == *own_id || p.url.is_empty() { continue; }
+            if self.trust.is_evicted(&p.node_id).await { continue; }
+            if self.trust.is_trusted(&p.node_id).await { continue; } // already known
+            match self.trust.register(&p.node_id, &p.public_key_hex, &p.url).await {
+                Ok(_) => { registered += 1; }
+                Err(e) => warn!("gossip register error for {}: {e}", &p.node_id[..16.min(p.node_id.len())]),
+            }
+        }
+        if registered > 0 {
+            info!("gossip: discovered {} new peer(s) from {}", registered, peer_url);
         }
     }
 

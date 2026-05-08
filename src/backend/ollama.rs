@@ -157,8 +157,9 @@ impl ModelBackend for OllamaBackend {
             kind:        "message".into(),
             role:        "assistant".into(),
             content:     vec![ContentBlock {
-                kind: "text".into(),
-                text: Some(answer_text),
+                kind:  "text".into(),
+                text:  Some(answer_text),
+                extra: Default::default(),
             }],
             model:       self.model_id.clone(),
             stop_reason: Some("end_turn".into()),

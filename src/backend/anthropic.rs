@@ -56,14 +56,15 @@ impl ModelBackend for AnthropicBackend {
         body.stream  = Some(false); // non-streaming path
         body.model   = self.model.clone();
 
-        let resp = self.client
+        let mut builder = self.client
             .post(&url)
             .header(self.auth_header_name(), self.auth_header())
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+            .header("content-type", "application/json");
+        if let Some(beta) = &body.anthropic_beta {
+            builder = builder.header("anthropic-beta", beta.as_str());
+        }
+        let resp = builder.json(&body).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -115,14 +116,15 @@ impl AnthropicBackend {
         body.stream  = Some(true);
         body.model   = self.model.clone();
 
-        let resp = self.client
+        let mut builder = self.client
             .post(&url)
             .header(self.auth_header_name(), self.auth_header())
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+            .header("content-type", "application/json");
+        if let Some(beta) = &body.anthropic_beta {
+            builder = builder.header("anthropic-beta", beta.as_str());
+        }
+        let resp = builder.json(&body).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -132,8 +133,8 @@ async fn run_server(
     if let Some(url) = cnc_url_override     { cfg.node.cnc_url     = url; }
     if let Some(nid) = cnc_node_id_override { cfg.node.cnc_node_id = nid; }
 
-    let cfg = Arc::new(cfg);
-    let is_cnc = cfg.node.role == NodeRole::Cnc;
+    let cfg = Arc::new(ArcSwap::new(Arc::new(cfg)));
+    let is_cnc = cfg.load().node.role == NodeRole::Cnc;
 
     // ── Node identity ─────────────────────────────────────────────────────
     let identity = Arc::new(NodeIdentity::load_or_generate("node_identity.key")?);
@@ -144,16 +145,20 @@ async fn run_server(
     // ── Credentials ───────────────────────────────────────────────────────
     let creds = auth::load()?;
 
+    // Snapshot for startup use — these fields seed one-time-init structs and
+    // are safe to read once; the live config is accessed via cfg.load() later.
+    let c = cfg.load();
+
     // ── Stores ────────────────────────────────────────────────────────────
-    let cache  = Arc::new(CacheStore::open(&cfg.cache.db_path, &identity.fingerprint).await?);
-    let budget = Arc::new(BudgetLedger::open(cfg.budget.clone()).await?);
+    let cache  = Arc::new(CacheStore::open(&c.cache.db_path, &identity.fingerprint).await?);
+    let budget = Arc::new(BudgetLedger::open(c.budget.clone()).await?);
     let trust  = Arc::new(TrustStore::open("claude-cache.trust.db", &identity.fingerprint).await?);
 
-    let our_url = format!("http://{}:{}", cfg.server.host, cfg.server.port);
+    let our_url = format!("http://{}:{}", c.server.host, c.server.port);
 
     // ── Bootstrap trust for config-declared peers ─────────────────────────
     // Config peers are explicitly trusted: operator declared them.
-    for peer in &cfg.federation.peers {
+    for peer in &c.federation.peers {
         trust.register_config_peer(
             &peer.node_id,
             &peer.public_key_hex,
@@ -175,47 +180,47 @@ async fn run_server(
     }
 
     // ── Client: register + trust the CNC if configured ───────────────────
-    let cnc_url_resolved = if !cfg.node.cnc_url.is_empty() {
-        Some(cfg.node.cnc_url.clone())
+    let cnc_url_resolved = if !c.node.cnc_url.is_empty() {
+        Some(c.node.cnc_url.clone())
     } else {
         None
     };
 
     if let Some(ref cnc_url) = cnc_url_resolved {
-        if !cfg.node.cnc_node_id.is_empty() {
+        if !c.node.cnc_node_id.is_empty() {
             // Trust the CNC immediately — we know its fingerprint from config
             trust.register_config_peer(
-                &cfg.node.cnc_node_id,
+                &c.node.cnc_node_id,
                 "",   // public key filled in on first announce from CNC
                 cnc_url,
                 true, // CNC is a head node
             ).await?;
-            info!("CNC trusted: {} ({})", &cfg.node.cnc_node_id[..16.min(cfg.node.cnc_node_id.len())], cnc_url);
+            info!("CNC trusted: {} ({})", &c.node.cnc_node_id[..16.min(c.node.cnc_node_id.len())], cnc_url);
         }
     }
 
-    info!("listening on {}:{}", cfg.server.host, cfg.server.port);
+    info!("listening on {}:{}", c.server.host, c.server.port);
 
     // ── Embedder ──────────────────────────────────────────────────────────
-    let embedder: Arc<dyn Embedder> = if cfg.embedding.enabled {
-        Arc::new(OllamaEmbedder::new(&cfg.embedding))
+    let embedder: Arc<dyn Embedder> = if c.embedding.enabled {
+        Arc::new(OllamaEmbedder::new(&c.embedding))
     } else {
-        Arc::new(StubEmbedder::new(cfg.embedding.dimensions))
+        Arc::new(StubEmbedder::new(c.embedding.dimensions))
     };
 
     // ── Backends ──────────────────────────────────────────────────────────
-    let anthropic = Arc::new(AnthropicBackend::new(&cfg.api, creds.clone()));
-    let ollama    = Arc::new(OllamaBackend::new(&cfg.local));
+    let anthropic = Arc::new(AnthropicBackend::new(&c.api, creds.clone()));
+    let ollama    = Arc::new(OllamaBackend::new(&c.local));
 
     let local_backend: Arc<dyn ModelBackend> = ollama;
     let api_backend:   Arc<dyn ModelBackend> = anthropic.clone();
 
     // ── Federation ────────────────────────────────────────────────────────
     let federation = Arc::new(FederationClient::new(
-        cfg.federation.enabled,
+        c.federation.enabled,
         identity.clone(),
         trust.clone(),
-        cfg.federation.lookup_timeout_ms,
+        c.federation.lookup_timeout_ms,
     ));
 
     // ── Router ────────────────────────────────────────────────────────────
@@ -235,6 +240,20 @@ async fn run_server(
         tokio::spawn(async move {
             let applied = fed_sync.sync_revocations(&cache_sync).await;
             if applied > 0 { info!("startup: applied {applied} revocations from peers"); }
+        });
+    }
+
+    // ── Startup: bootstrap peer discovery from config peers ───────────────
+    // Pull each config peer's trusted peer list so we learn the full mesh
+    // after a single hop without needing everyone in config.toml.
+    if c.federation.enabled && !c.federation.peers.is_empty() {
+        let fed_boot  = federation.clone();
+        let peer_urls: Vec<String> = c.federation.peers.iter().map(|p| p.url.clone()).collect();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            for url in &peer_urls {
+                fed_boot.exchange_peers(url).await;
+            }
         });
     }
 
@@ -289,9 +308,9 @@ async fn run_server(
     }
 
     // ── Background: peer health checks ───────────────────────────────────
-    if cfg.health.enabled && cfg.federation.enabled {
+    if c.health.enabled && c.federation.enabled {
         let health_trust  = trust.clone();
-        let health_cfg    = cfg.health.clone();
+        let health_cfg    = c.health.clone();
         let health_our_id = identity.fingerprint.clone();
         tokio::spawn(async move {
             health::run(health_trust, health_cfg, health_our_id).await;
@@ -300,10 +319,11 @@ async fn run_server(
 
     // ── Background: eviction + gossip + revocation sync ───────────────────
     {
-        let evict_cache  = cache.clone();
-        let fed          = federation.clone();
-        let bg_url       = our_url.clone();
-        let max_size_bytes = cfg.cache.max_size_mb * 1024 * 1024;
+        let evict_cache    = cache.clone();
+        let fed            = federation.clone();
+        let trust_bg       = trust.clone();
+        let bg_url         = our_url.clone();
+        let max_size_bytes = c.cache.max_size_mb * 1024 * 1024;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
@@ -318,6 +338,14 @@ async fn run_server(
                 }
                 if let Ok(hashes) = evict_cache.list_shared_hashes(500, 0).await {
                     fed.announce(hashes, &bg_url).await;
+                }
+                // Pull peer lists from all trusted peers to keep discovery fresh.
+                if let Ok(known) = trust_bg.list_trusted().await {
+                    for peer in known {
+                        if !peer.url.is_empty() {
+                            fed.exchange_peers(&peer.url).await;
+                        }
+                    }
                 }
                 let applied = fed.sync_revocations(&evict_cache).await;
                 if applied > 0 { info!("hourly sync: applied {applied} revocations from peers"); }
@@ -334,8 +362,43 @@ async fn run_server(
         info!("portal auth: disabled (set CLAUDE_CACHE_PORTAL_TOKEN to enable)");
     }
 
+    // ── Background: config file mtime watcher (auto hot-reload) ──────────
+    {
+        let watch_path = config_path.clone();
+        let watch_cfg  = cfg.clone();
+        tokio::spawn(async move {
+            let mut last_mtime = std::fs::metadata(&watch_path).ok()
+                .and_then(|m| m.modified().ok());
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let current = std::fs::metadata(&watch_path).ok()
+                    .and_then(|m| m.modified().ok());
+                if current.is_some() && current != last_mtime {
+                    last_mtime = current;
+                    match AppConfig::load(&watch_path) {
+                        Ok(new_cfg) => {
+                            watch_cfg.store(Arc::new(new_cfg));
+                            info!("config auto-reloaded from {watch_path}");
+                        }
+                        Err(e) => tracing::warn!("config auto-reload failed: {e}"),
+                    }
+                }
+            }
+        });
+    }
+
     // ── Server ────────────────────────────────────────────────────────────
-    let node_id = identity.fingerprint.clone();
+    let node_id    = identity.fingerprint.clone();
+    let rate_limit = c.limits.messages_per_minute;
+    let api_url    = c.api.base_url.clone();
+    let auto_promo = c.node.auto_promote_peers;
+    let drain_secs = c.limits.shutdown_timeout_secs;
+    let fed_enabled = c.federation.enabled;
+    let rpm_limit   = c.limits.messages_per_minute;
+    // Drop the startup snapshot — AppState holds cfg for runtime reads.
+    drop(c);
+
     let state = Arc::new(AppState {
         router,
         cache,
@@ -344,23 +407,25 @@ async fn run_server(
         trust,
         identity,
         anthropic,
+        cfg:         cfg.clone(),
+        config_path: config_path.clone(),
         node_id,
         is_cnc,
-        auto_promote_peers:  cfg.node.auto_promote_peers,
-        api_base_url:        cfg.api.base_url.clone(),
+        auto_promote_peers:  auto_promo,
+        api_base_url:        api_url,
         api_creds:           creds,
         portal_token,
-        rate_limit_rpm:      cfg.limits.messages_per_minute,
+        rate_limit_rpm:      rate_limit,
     });
 
     let app      = build_router(state);
-    let addr     = format!("{}:{}", cfg.server.host, cfg.server.port);
+    let addr     = format!("{}:{}", cfg.load().server.host, cfg.load().server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     info!("─── endpoints ───────────────────────────────────────────");
     info!("  POST  http://{addr}/v1/messages          (proxy)");
     info!("  GET   http://{addr}/health");
-    if cfg.federation.enabled {
+    if fed_enabled {
         info!("  POST  http://{addr}/v1/federation/announce");
         info!("  GET   http://{addr}/v1/federation/peers");
         info!("  GET   http://{addr}/v1/federation/lookup/:hash");
@@ -376,6 +441,7 @@ async fn run_server(
     info!("  GET   http://{addr}/api/cache/search");
     info!("  GET   http://{addr}/api/spend");
     info!("  POST  http://{addr}/api/pricing");
+    info!("  POST  http://{addr}/api/config/reload");
     info!("  GET   http://{addr}/api/trust");
     info!("  GET   http://{addr}/api/peers/health");
     info!("  GET   http://{addr}/api/routing");
@@ -391,11 +457,9 @@ async fn run_server(
         info!("  POST  http://{addr}/v1/evict/:node_id");
     }
     info!("─────────────────────────────────────────────────────────");
-    if cfg.limits.messages_per_minute > 0 {
-        info!("rate limit: {} req/min on POST /v1/messages", cfg.limits.messages_per_minute);
+    if rpm_limit > 0 {
+        info!("rate limit: {} req/min on POST /v1/messages", rpm_limit);
     }
-
-    let drain_secs = cfg.limits.shutdown_timeout_secs;
 
     // Wait for SIGTERM/Ctrl+C, then give in-flight requests up to drain_secs
     // to complete before forcing exit.  The sleep starts AFTER the signal so

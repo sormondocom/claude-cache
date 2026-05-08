@@ -7,6 +7,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router as AxumRouter,
 };
+use arc_swap::ArcSwap;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use std::num::NonZeroU32;
 use bytes::Bytes;
@@ -19,7 +20,8 @@ use tracing::{info, warn};
 use crate::backend::{MessagesRequest, MessagesResponse};
 use crate::budget::BudgetLedger;
 use crate::cache::CacheStore;
-use crate::federation::{entry_to_federated, AnnouncePayload, FederationClient, SemanticFederatedEntry, SemanticLookupRequest};
+use crate::config::AppConfig;
+use crate::federation::{entry_to_federated, AnnouncePayload, FederationClient, PeerDescriptor, SemanticFederatedEntry, SemanticLookupRequest};
 use crate::identity::announce_message;
 use crate::identity::NodeIdentity;
 use crate::router::{RouteDecision, Router};
@@ -36,6 +38,8 @@ pub struct AppState {
     pub trust:       Arc<TrustStore>,
     pub identity:    Arc<NodeIdentity>,
     pub anthropic:   Arc<AnthropicBackend>,
+    pub cfg:         Arc<ArcSwap<AppConfig>>,
+    pub config_path: String,
     /// Ed25519 fingerprint — the canonical node identity used everywhere.
     pub node_id:          String,
     pub is_cnc:           bool,
@@ -86,6 +90,7 @@ pub fn build_router(state: SharedState) -> AxumRouter {
         .route("/stats",        get(handle_stats))
         .route("/api/pricing",  post(handle_update_pricing))
         .route("/api/spend",    get(handle_spend))
+        .route("/api/config/reload", post(handle_config_reload))
         .route("/v1/trust",              get(handle_trust_list))
         .route("/v1/trust/:node_id",     post(handle_trust_promote))
         .route("/v1/evict/:node_id",     post(handle_evict))
@@ -136,6 +141,7 @@ pub fn build_router(state: SharedState) -> AxumRouter {
         .route("/v1/federation/lookup/:hash", get(handle_federation_lookup))
         .route("/v1/federation/announce",    post(handle_federation_announce))
         .route("/v1/federation/peers",       get(handle_federation_peers))
+        .route("/v1/federation/peers/list",  get(handle_federation_peers_list))
         .route("/v1/federation/semantic",    post(handle_federation_semantic))
         .route("/v1/federation/revocations", get(handle_get_revocations)
                                              .post(handle_receive_revocation))
@@ -152,9 +158,12 @@ pub fn build_router(state: SharedState) -> AxumRouter {
 
 async fn handle_messages(
     State(state): State<SharedState>,
-    _headers:     HeaderMap,
-    Json(req):    Json<MessagesRequest>,
+    headers:      HeaderMap,
+    Json(mut req): Json<MessagesRequest>,
 ) -> Response {
+    if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+        req.anthropic_beta = Some(beta.to_string());
+    }
     let is_stream = req.is_streaming();
 
     if is_stream {
@@ -342,6 +351,26 @@ async fn handle_spend(State(state): State<SharedState>) -> Json<Value> {
     Json(json!({ "daily": summary }))
 }
 
+async fn handle_config_reload(State(state): State<SharedState>) -> Response {
+    match AppConfig::load(&state.config_path) {
+        Ok(new_cfg) => {
+            let old = state.cfg.load();
+            if old.cache.db_path != new_cfg.cache.db_path
+                || old.budget.db_path != new_cfg.budget.db_path
+            {
+                warn!("config reload: db_path changes ignored — restart required");
+            }
+            state.cfg.store(Arc::new(new_cfg));
+            info!("config reloaded from {}", state.config_path);
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": e.to_string() })),
+        ).into_response(),
+    }
+}
+
 // ── Federation ─────────────────────────────────────────────────────────────
 
 async fn handle_federation_lookup(
@@ -424,6 +453,16 @@ async fn handle_federation_announce(
         &payload.node_id[..16], payload.hashes.len()
     );
 
+    // 6. Process gossip peer list — register any unknown non-evicted peers as Untrusted
+    if let Some(gossip_peers) = &payload.known_peers {
+        for p in gossip_peers {
+            if p.node_id == state.node_id || p.url.is_empty() { continue; }
+            if state.trust.is_evicted(&p.node_id).await { continue; }
+            if state.trust.is_trusted(&p.node_id).await { continue; }
+            let _ = state.trust.register(&p.node_id, &p.public_key_hex, &p.url).await;
+        }
+    }
+
     // Pull revocations from this peer in the background so we stay in sync
     {
         let fed   = state.federation.clone();
@@ -493,6 +532,23 @@ async fn handle_federation_peers(State(state): State<SharedState>) -> Json<Value
         "enabled":       state.federation.is_enabled(),
         "trusted_peers": trusted.len(),
     }))
+}
+
+/// Returns the list of trusted peers with their URLs and public keys.
+/// Used by gossip discovery: new nodes call this to bootstrap knowledge
+/// of the full mesh from a single known peer.
+async fn handle_federation_peers_list(State(state): State<SharedState>) -> Json<Vec<PeerDescriptor>> {
+    let peers = state.trust.list_trusted().await.unwrap_or_default();
+    let list: Vec<PeerDescriptor> = peers
+        .into_iter()
+        .filter(|r| !r.url.is_empty() && r.node_id != state.node_id)
+        .map(|r| PeerDescriptor {
+            node_id:        r.node_id,
+            url:            r.url,
+            public_key_hex: r.public_key_hex,
+        })
+        .collect();
+    Json(list)
 }
 
 // ── Trust management ────────────────────────────────────────────────────────
