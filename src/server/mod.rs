@@ -15,7 +15,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{error, info, warn};
 
 use crate::backend::{MessagesRequest, MessagesResponse};
 use crate::budget::BudgetLedger;
@@ -51,6 +52,9 @@ pub struct AppState {
     pub portal_token:     Option<String>,
     /// Messages-per-minute rate limit applied to POST /v1/messages.  0 = disabled.
     pub rate_limit_rpm:   u32,
+    /// Set when an Anthropic API call returns a credit-exhaustion error.
+    /// While true, /v1/messages bypasses proxy routing and forwards with client credentials.
+    pub credits_exhausted: AtomicBool,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -88,8 +92,9 @@ pub fn build_router(state: SharedState) -> AxumRouter {
     // Protected routes require a portal token when one is configured.
     let protected = AxumRouter::new()
         .route("/stats",        get(handle_stats))
-        .route("/api/pricing",  post(handle_update_pricing))
-        .route("/api/spend",    get(handle_spend))
+        .route("/api/pricing",       post(handle_update_pricing))
+        .route("/api/spend",         get(handle_spend))
+        .route("/api/credits/reset", post(handle_credits_reset))
         .route("/api/config/reload", post(handle_config_reload))
         .route("/v1/trust",              get(handle_trust_list))
         .route("/v1/trust/:node_id",     post(handle_trust_promote))
@@ -164,16 +169,26 @@ async fn handle_messages(
     if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
         req.anthropic_beta = Some(beta.to_string());
     }
-    let is_stream = req.is_streaming();
 
+    let client_auth = extract_client_auth(&headers);
+
+    if state.credits_exhausted.load(Ordering::Relaxed) {
+        return handle_credit_bypass(&state, req, client_auth).await;
+    }
+
+    let is_stream = req.is_streaming();
     if is_stream {
-        handle_stream_messages(state, req).await
+        handle_stream_messages(state, req, client_auth).await
     } else {
-        handle_sync_messages(state, req).await
+        handle_sync_messages(state, req, client_auth).await
     }
 }
 
-async fn handle_sync_messages(state: SharedState, req: MessagesRequest) -> Response {
+async fn handle_sync_messages(
+    state:       SharedState,
+    req:         MessagesRequest,
+    client_auth: Option<(String, String)>,
+) -> Response {
     match state.router.route(&req).await {
         Ok(routed) => {
             info!(
@@ -189,6 +204,11 @@ async fn handle_sync_messages(state: SharedState, req: MessagesRequest) -> Respo
             );
             resp
         }
+        Err(e) if is_credit_exhausted(&e.to_string()) => {
+            error!("API credit balance exhausted — proxy bypass activated. POST /api/credits/reset to restore after topping up.");
+            state.credits_exhausted.store(true, Ordering::Relaxed);
+            handle_credit_bypass(&state, req, client_auth).await
+        }
         Err(e) => {
             warn!("router error: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
@@ -196,7 +216,11 @@ async fn handle_sync_messages(state: SharedState, req: MessagesRequest) -> Respo
     }
 }
 
-async fn handle_stream_messages(state: SharedState, req: MessagesRequest) -> Response {
+async fn handle_stream_messages(
+    state:       SharedState,
+    req:         MessagesRequest,
+    client_auth: Option<(String, String)>,
+) -> Response {
     // For streaming: check cache/local first (non-stream), then if it's an API
     // call, do a true streaming passthrough.
 
@@ -212,6 +236,11 @@ async fn handle_stream_messages(state: SharedState, req: MessagesRequest) -> Res
             // Cache/local hit — synthesize SSE
             info!("stream: synthesizing SSE from {}", routed.decision.as_str());
             return synthesize_sse(routed.response).into_response();
+        }
+        Err(e) if is_credit_exhausted(&e.to_string()) => {
+            error!("API credit balance exhausted — proxy bypass activated. POST /api/credits/reset to restore after topping up.");
+            state.credits_exhausted.store(true, Ordering::Relaxed);
+            return handle_credit_bypass(&state, req, client_auth).await;
         }
         _ => {}
     }
@@ -303,6 +332,7 @@ async fn handle_health(State(state): State<SharedState>) -> Json<Value> {
         "node_id": state.node_id,
         "cache_entries": stats.total_entries,
         "federation_peers": state.federation.peer_count().await,
+        "credits_exhausted": state.credits_exhausted.load(Ordering::Relaxed),
     }))
 }
 
@@ -327,6 +357,7 @@ async fn handle_stats(State(state): State<SharedState>) -> Json<Value> {
                 json!({ "status": "exceeded", "spent_usd": spent_usd, "limit_usd": limit_usd }),
         }),
         "spend_7d": summary,
+        "credits_exhausted": state.credits_exhausted.load(Ordering::Relaxed),
     }))
 }
 
@@ -745,6 +776,102 @@ async fn handle_export_cache(
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
+}
+
+// ── Credit exhaustion helpers ─────────────────────────────────────────────
+
+fn is_credit_exhausted(msg: &str) -> bool {
+    msg.contains("credit balance is too low")
+}
+
+fn extract_client_auth(headers: &HeaderMap) -> Option<(String, String)> {
+    if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        return Some(("Authorization".to_string(), v.to_string()));
+    }
+    if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return Some(("x-api-key".to_string(), v.to_string()));
+    }
+    None
+}
+
+/// Forward a request directly to the Anthropic API using the client's own credentials,
+/// bypassing all proxy routing and caching.  Used when the proxy's API credit balance
+/// is exhausted but the client (e.g. Claude Code) has its own OAuth credits.
+async fn handle_credit_bypass(
+    state:       &SharedState,
+    req:         MessagesRequest,
+    client_auth: Option<(String, String)>,
+) -> Response {
+    let Some((auth_name, auth_val)) = client_auth else {
+        warn!("credit bypass: no client credentials in request — cannot forward");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "type":  "error",
+                "error": {
+                    "type":    "credit_exhausted",
+                    "message": "API credit balance exhausted and no client credentials available for bypass. POST /api/credits/reset after topping up."
+                }
+            })),
+        ).into_response();
+    };
+
+    let is_stream = req.is_streaming();
+    warn!("credit bypass: forwarding {} to Anthropic with client credentials (caching skipped)",
+        if is_stream { "stream" } else { "request" });
+
+    let url = format!("{}/v1/messages", state.api_base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let mut builder = client
+        .post(&url)
+        .header(auth_name.as_str(), auth_val.as_str())
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json");
+
+    if let Some(beta) = &req.anthropic_beta {
+        builder = builder.header("anthropic-beta", beta.as_str());
+    }
+
+    match builder.json(&req).send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            if is_stream {
+                let body = Body::from_stream(resp.bytes_stream());
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "text/event-stream")
+                    .header("cache-control", "no-cache")
+                    .header("x-router-source", "credit-bypass-stream")
+                    .body(body)
+                    .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+            } else {
+                let bytes = resp.bytes().await.unwrap_or_default();
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .header("x-router-source", "credit-bypass")
+                    .body(Body::from(bytes))
+                    .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+            }
+        }
+        Err(e) => {
+            warn!("credit bypass request failed: {e}");
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("credit bypass failed: {e}")}))).into_response()
+        }
+    }
+}
+
+async fn handle_credits_reset(State(state): State<SharedState>) -> Json<Value> {
+    let was_exhausted = state.credits_exhausted.swap(false, Ordering::Relaxed);
+    if was_exhausted {
+        info!("credit exhaustion flag cleared — proxy routing restored");
+    }
+    Json(json!({ "ok": true, "was_exhausted": was_exhausted, "proxy_mode": "restored" }))
 }
 
 // ── Passthrough fallback ───────────────────────────────────────────────────

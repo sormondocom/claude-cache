@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
@@ -416,6 +417,7 @@ async fn run_server(
         api_creds:           creds,
         portal_token,
         rate_limit_rpm:      rate_limit,
+        credits_exhausted:   AtomicBool::new(false),
     });
 
     let app      = build_router(state);
@@ -442,6 +444,7 @@ async fn run_server(
     info!("  GET   http://{addr}/api/spend");
     info!("  POST  http://{addr}/api/pricing");
     info!("  POST  http://{addr}/api/config/reload");
+    info!("  POST  http://{addr}/api/credits/reset");
     info!("  GET   http://{addr}/api/trust");
     info!("  GET   http://{addr}/api/peers/health");
     info!("  GET   http://{addr}/api/routing");
