@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell($env:CARGO_TARGET_DIR = \"D:\\\\rust\\\\cargo\"; Set-Location \"D:\\\\claude-cache\"; cargo check 2>&1)",
-      "PowerShell($env:CARGO_TARGET_DIR = \"D:\\\\rust\\\\cargo\"; Set-Location \"D:\\\\claude-cache\"; cargo check 2>&1 | Select-String -Pattern \"^error|Finished\")",
-      "PowerShell($env:CARGO_TARGET_DIR = \"D:\\\\rust\\\\cargo\"; Set-Location \"D:\\\\claude-cache\"; cargo test 2>&1)"
-    ]
-  }
-}
