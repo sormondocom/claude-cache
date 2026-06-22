@@ -35,8 +35,9 @@ struct OllamaRequest {
     messages: Vec<OllamaMessage>,
     stream:   bool,
     options:  OllamaOptions,
+    // "json" string works on all Ollama versions; JSON schema objects require 0.4+.
     #[serde(skip_serializing_if = "Option::is_none")]
-    format:   Option<serde_json::Value>,
+    format:   Option<String>,
 }
 
 #[derive(Serialize)]
@@ -78,17 +79,6 @@ const CONFIDENCE_SYSTEM: &str =
      {\"answer\": \"<your full response here>\", \"confidence\": <decimal 0.0-1.0>}. \
      Set confidence to how confident you are in the correctness and completeness of the answer.";
 
-fn confidence_format_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "answer":     { "type": "string" },
-            "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
-        },
-        "required": ["answer", "confidence"]
-    })
-}
-
 // ── Backend impl ──────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -98,9 +88,11 @@ impl ModelBackend for OllamaBackend {
         let url   = format!("{}/api/chat", self.base_url);
 
         // Build system message: merge confidence instruction with any user-provided system prompt.
+        // Use as_str() to extract the raw string value — Display on Value::String includes
+        // JSON double-quotes which would be injected verbatim into the Ollama system content.
         let sys_content = match &req.system {
-            Some(user_sys) => format!("{CONFIDENCE_SYSTEM}\n\n{user_sys}"),
-            None           => CONFIDENCE_SYSTEM.to_string(),
+            Some(serde_json::Value::String(s)) => format!("{CONFIDENCE_SYSTEM}\n\n{s}"),
+            Some(_) | None                     => CONFIDENCE_SYSTEM.to_string(),
         };
 
         let mut messages = Vec::with_capacity(req.messages.len() + 1);
@@ -123,7 +115,7 @@ impl ModelBackend for OllamaBackend {
             messages,
             stream:   false,
             options:  OllamaOptions { temperature: 0.1 },
-            format:   Some(confidence_format_schema()),
+            format:   Some("json".to_string()),
         };
 
         let http_resp = self.client

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod error;
 pub mod health;
 pub mod backend;
 pub mod budget;
@@ -8,6 +9,7 @@ pub mod domain;
 pub mod embedding;
 pub mod federation;
 pub mod identity;
+pub mod learning;
 pub mod policy;
 pub mod portal;
 pub mod router;

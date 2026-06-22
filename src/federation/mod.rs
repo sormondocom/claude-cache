@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cache::{CacheEntry, CacheStore};
 use crate::identity::{announce_message, NodeIdentity, RemoteKey};
@@ -119,6 +119,29 @@ pub struct LookupResponse {
 pub struct PeerNode {
     pub id:  String,
     pub url: String,
+}
+
+/// Domain knowledge payload served by `GET /v1/federation/knowledge/:domain`.
+/// Carries the local node's distilled knowledge doc, per-intent calibration biases,
+/// and labeled contrast pairs so peers can incorporate mesh-wide learning.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PeerKnowledge {
+    pub domain:             String,
+    pub node_id:            String,
+    pub knowledge_doc:      Option<String>,
+    /// `intent → bias` — additive correction to local model confidence for this domain.
+    pub calibration_biases: std::collections::HashMap<String, f64>,
+    pub contrast_pairs:     Vec<PeerContrastPair>,
+}
+
+/// A labeled failure case from a peer node: local_attempt was wrong, correct
+/// is the API-authoritative answer.  Peers incorporate these into distillation
+/// so the mesh collectively learns what patterns to avoid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerContrastPair {
+    pub intent:  String,
+    pub wrong:   String,
+    pub correct: String,
 }
 
 /// Minimal peer advertisement used for gossip discovery.
@@ -406,6 +429,34 @@ impl FederationClient {
         });
 
         filtered
+    }
+
+    /// Fetch distilled domain knowledge from all trusted reachable peers for `domain`.
+    /// Returns one `PeerKnowledge` per peer that responded successfully.  Used by the
+    /// Distiller to blend peer knowledge docs and contrast pairs into local synthesis.
+    pub async fn fetch_peer_knowledge(&self, domain: &str) -> Vec<PeerKnowledge> {
+        if !self.enabled { return vec![]; }
+        let peers = self.reachable_peers_sorted().await;
+        if peers.is_empty() { return vec![]; }
+        let mut results = Vec::new();
+        for peer in peers {
+            let url = format!("{}/v1/federation/knowledge/{}", peer.url.trim_end_matches('/'), domain);
+            match self.client.get(&url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    match r.json::<PeerKnowledge>().await {
+                        Ok(pk) => {
+                            debug!("federation knowledge: fetched '{}' from {}", domain,
+                                &peer.id[..16.min(peer.id.len())]);
+                            results.push(pk);
+                        }
+                        Err(e) => debug!("federation knowledge: parse error from {}: {e}",
+                            &peer.id[..16.min(peer.id.len())]),
+                    }
+                }
+                _ => {}
+            }
+        }
+        results
     }
 
     /// Count of currently trusted peers (excludes self, requires a non-empty URL).

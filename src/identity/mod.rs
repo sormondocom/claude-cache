@@ -68,11 +68,20 @@ impl NodeIdentity {
         std::fs::write(path, &hex)
             .with_context(|| format!("writing identity to {path}"))?;
 
-        // Restrict permissions on Unix so the private key isn't world-readable.
+        // Restrict permissions so the private key isn't world-readable.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(windows)]
+        {
+            // Remove inherited ACEs, grant only the current user full control.
+            if let Ok(username) = std::env::var("USERNAME") {
+                let _ = std::process::Command::new("icacls")
+                    .args([path, "/inheritance:r", "/grant:r", &format!("{username}:(F)")])
+                    .output();
+            }
         }
 
         Ok(())

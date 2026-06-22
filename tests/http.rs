@@ -7,8 +7,11 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
+use arc_swap::ArcSwap;
+use std::sync::atomic::AtomicBool;
+
 use claude_cache::{
-    auth::Credentials,
+    auth::CredentialStore,
     backend::{
         AnthropicBackend, BackendResult, ContentBlock,
         MessagesRequest, MessagesResponse, ModelBackend, Usage,
@@ -19,6 +22,7 @@ use claude_cache::{
     embedding::StubEmbedder,
     federation::FederationClient,
     identity::NodeIdentity,
+    learning::{CalibrationMap, Distiller, ThresholdMap},
     router::Router,
     server::{AppState, build_router},
     trust::TrustStore,
@@ -40,7 +44,7 @@ impl ModelBackend for MockBackend {
                 id:          "test-id".into(),
                 kind:        "message".into(),
                 role:        "assistant".into(),
-                content:     vec![ContentBlock { kind: "text".into(), text: Some(self.text.into()) }],
+                content:     vec![ContentBlock { kind: "text".into(), text: Some(self.text.into()), extra: Default::default() }],
                 model:       self.name_str.into(),
                 stop_reason: Some("end_turn".into()),
                 usage:       Usage { input_tokens: 10, output_tokens: 20 },
@@ -67,7 +71,7 @@ impl ServerParams {
     fn force_api(daily_limit: f64) -> Self {
         ServerParams {
             daily_limit_usd:  daily_limit,
-            routing:          RoutingConfig { novelty_threshold: 0.0, complexity_threshold: 0.0, consequence_threshold: 0.0 },
+            routing:          RoutingConfig { novelty_threshold: 0.0, complexity_threshold: 0.0, consequence_threshold: 0.0, draft_verify_enabled: false, draft_verify_min_sim: 0.65 },
             local_confidence: 0.9,
             confidence_floor: 0.5,
             portal_token:     None,
@@ -78,7 +82,7 @@ impl ServerParams {
     fn force_local(daily_limit: f64) -> Self {
         ServerParams {
             daily_limit_usd:  daily_limit,
-            routing:          RoutingConfig { novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0 },
+            routing:          RoutingConfig { novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0, draft_verify_enabled: false, draft_verify_min_sim: 0.65 },
             local_confidence: 0.9,
             confidence_floor: 0.5,
             portal_token:     None,
@@ -100,6 +104,7 @@ async fn start_server(p: ServerParams) -> (String, tempfile::TempDir) {
     let cache  = Arc::new(CacheStore::open(&cache_path,  &identity.fingerprint).await.unwrap());
     let trust  = Arc::new(TrustStore::open(&trust_path,  &identity.fingerprint).await.unwrap());
     let budget = Arc::new(BudgetLedger::open(BudgetConfig {
+        enabled:           true,
         db_path:           budget_path,
         daily_limit_usd:   p.daily_limit_usd,
         warn_at_pct:       80,
@@ -112,15 +117,17 @@ async fn start_server(p: ServerParams) -> (String, tempfile::TempDir) {
     cfg.local.enabled          = true;
     cfg.local.confidence_floor = p.confidence_floor;
     cfg.embedding.enabled      = false;
-    let cfg = Arc::new(cfg);
+    let cfg_arc = Arc::new(ArcSwap::from_pointee(cfg));
 
     let router = Router::new(
-        cfg.clone(),
+        cfg_arc.clone(),
         cache.clone(),
         budget.clone(),
         Arc::new(StubEmbedder::new(64)),
         Arc::new(MockBackend { name_str: "mock-local", confidence: Some(p.local_confidence), text: "local answer" }),
         Arc::new(MockBackend { name_str: "mock-api",   confidence: None,                     text: "api answer"   }),
+        Arc::new(ArcSwap::from_pointee(ThresholdMap::new())),
+        Arc::new(ArcSwap::from_pointee(CalibrationMap::new())),
     );
 
     let federation = Arc::new(FederationClient::new(
@@ -130,11 +137,26 @@ async fn start_server(p: ServerParams) -> (String, tempfile::TempDir) {
     // AnthropicBackend is only used for streaming passthrough; point it at
     // an unreachable address so non-streaming tests never touch it.
     let dummy_api_cfg = ApiConfig {
-        model:    "test-model".to_string(),
-        base_url: "http://127.0.0.1:1".to_string(),
+        model:                          "test-model".to_string(),
+        base_url:                       "http://127.0.0.1:1".to_string(),
+        backend:                        "anthropic".to_string(),
+        enabled:                        true,
+        max_retries:                    0,
+        retry_delay_ms:                 500,
+        request_timeout_secs:           30,
+        claude_code_max_concurrency:    4,
+        claude_code_queue_timeout_secs: 30,
     };
-    let dummy_creds = Credentials { api_key: "sk-ant-test-key".to_string() };
-    let anthropic = Arc::new(AnthropicBackend::new(&dummy_api_cfg, dummy_creds.clone()));
+    let anthropic = Arc::new(AnthropicBackend::new(
+        &dummy_api_cfg,
+        CredentialStore::from_key("sk-ant-test-key"),
+    ));
+
+    let distiller = Arc::new(Distiller::new(
+        cache.clone(),
+        cfg_arc.clone(),
+        Arc::new(MockBackend { name_str: "mock-local", confidence: Some(0.9), text: "distilled" }),
+    ));
 
     let node_id = identity.fingerprint.clone();
     let state = Arc::new(AppState {
@@ -145,13 +167,20 @@ async fn start_server(p: ServerParams) -> (String, tempfile::TempDir) {
         trust,
         identity,
         anthropic,
+        cfg:                cfg_arc,
+        config_path:        "test.toml".to_string(),
         node_id,
         is_cnc:             false,
         auto_promote_peers: false,
         api_base_url:       "http://127.0.0.1:1".to_string(),
-        api_creds:          dummy_creds,
+        api_creds:          CredentialStore::from_key("sk-ant-test-key"),
         portal_token:       p.portal_token,
         rate_limit_rpm:     p.rate_limit_rpm,
+        credits_exhausted:  AtomicBool::new(false),
+        manual_bypass:      AtomicBool::new(false),
+        distiller,
+        graph_cache:        tokio::sync::Mutex::new(None),
+        http_client:        reqwest::Client::new(),
     });
 
     let app      = build_router(state);
@@ -287,7 +316,7 @@ async fn budget_exceeded_blocks_api_call() {
     // daily_limit=0 → always exceeded; local mock returns 0.3 confidence < floor 0.5
     let (base, _dir) = start_server(ServerParams {
         daily_limit_usd:  0.0,
-        routing:          RoutingConfig { novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0 },
+        routing:          RoutingConfig { novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0, draft_verify_enabled: false, draft_verify_min_sim: 0.65 },
         local_confidence: 0.3,  // below floor
         confidence_floor: 0.5,
         portal_token:     None,
@@ -300,8 +329,9 @@ async fn budget_exceeded_blocks_api_call() {
         .json(&user_msg("write me a web server in Rust"))
         .send().await.unwrap();
 
-    // Must NOT return "api answer" — the API call must be blocked
-    assert_eq!(resp.status(), 500, "budget exceeded with no local fallback must return 500");
+    // Must NOT return "api answer" — the API call must be blocked.
+    // Budget exceeded now returns 429 (CC-E007) rather than 500.
+    assert_eq!(resp.status(), 429, "budget exceeded with no local fallback must return 429");
 }
 
 #[tokio::test]
@@ -575,6 +605,101 @@ async fn cache_search_filters_by_domain() {
     let entries = search["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1, "domain=rust filter must return only rust entries");
     assert_eq!(entries[0]["domain"], "rust");
+}
+
+/// A stream=true request that hits the exact cache must return SSE
+/// (content-type: text/event-stream) synthesized from the cached response,
+/// not a live API call.
+#[tokio::test]
+async fn stream_cache_hit_synthesizes_sse() {
+    let (base, _dir) = start_server(ServerParams::force_api(10.0)).await;
+    let client = reqwest::Client::new();
+
+    // Seed the cache with a non-stream request first.
+    client
+        .post(format!("{base}/v1/messages"))
+        .json(&user_msg("explain Rust generics in detail"))
+        .send().await.unwrap()
+        .bytes().await.unwrap(); // consume body
+
+    // Request the same prompt as a stream — must synthesize SSE from cache.
+    let mut stream_payload = user_msg("explain Rust generics in detail");
+    stream_payload["stream"] = json!(true);
+
+    let resp = client
+        .post(format!("{base}/v1/messages"))
+        .json(&stream_payload)
+        .send().await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()["x-router-source"],
+        "exact_cache",
+        "stream request must be served from cache, not a live API call"
+    );
+    let ct = resp.headers()["content-type"].to_str().unwrap();
+    assert!(ct.starts_with("text/event-stream"),
+        "cached stream response must use SSE content-type, got: {ct}");
+
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("event:"), "SSE body must contain event: lines");
+    assert!(body.contains("data:"),  "SSE body must contain data: lines");
+}
+
+/// Classified prompts must carry domain and intent trace headers so operators
+/// can observe the routing decision in proxy logs or client tooling.
+#[tokio::test]
+async fn response_trace_headers_domain_and_intent() {
+    let (base, _dir) = start_server(ServerParams::force_api(10.0)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&user_msg("explain Rust lifetimes and borrow checker in detail"))
+        .send().await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("x-cc-domain").and_then(|v| v.to_str().ok()),
+        Some("rust"),
+        "x-cc-domain must be set for classified prompts"
+    );
+    assert_eq!(
+        resp.headers().get("x-cc-intent").and_then(|v| v.to_str().ok()),
+        Some("explain"),
+        "x-cc-intent must be set for classified prompts"
+    );
+    // x-router-source must always be present regardless of routing decision
+    assert!(
+        resp.headers().get("x-router-source").is_some(),
+        "x-router-source must always be present"
+    );
+}
+
+/// Local model responses must also carry trace headers (routing gate scores).
+#[tokio::test]
+async fn local_model_response_has_routing_score_headers() {
+    let (base, _dir) = start_server(ServerParams::force_local(10.0)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&user_msg("write a hello world function in Python"))
+        .send().await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-router-source"], "local");
+    // Routing gate scores are set whenever the gate was evaluated
+    assert!(
+        resp.headers().get("x-cc-novelty").is_some(),
+        "x-cc-novelty must be present for local-routed responses"
+    );
+    assert!(
+        resp.headers().get("x-cc-complexity").is_some(),
+        "x-cc-complexity must be present for local-routed responses"
+    );
+    assert!(
+        resp.headers().get("x-cc-consequence").is_some(),
+        "x-cc-consequence must be present for local-routed responses"
+    );
 }
 
 #[tokio::test]

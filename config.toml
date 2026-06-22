@@ -3,9 +3,33 @@ host = "127.0.0.1"
 port = 3000
 
 [api]
-model = "claude-sonnet-4-6"
+# Set to false to disable all upstream Anthropic API calls (cache + local model only).
+# Useful when you want to run fully offline or cap costs to zero.
+enabled  = true
+model    = "claude-sonnet-4-6"
 base_url = "https://api.anthropic.com"
 # NEVER store api_key here — use ANTHROPIC_API_KEY env var
+
+# "anthropic"   — direct HTTPS to api.anthropic.com (requires ANTHROPIC_API_KEY)
+# "claude_code" — spawns the local `claude --print` CLI; works with any Pro/Max subscription
+# Auto-detected: if ANTHROPIC_API_KEY is absent, claude_code is used regardless of this field.
+backend = "claude_code"
+
+# Retry overloaded_error (capacity pressure, not quota) with exponential backoff.
+# Set max_retries = 0 to disable retries and fall through to local model immediately.
+max_retries          = 2     # number of retry attempts after the first failure
+retry_delay_ms       = 500   # base delay; doubles each attempt (500 → 1000 → 2000ms)
+
+# Timeout for upstream calls (API or claude CLI subprocess).
+# Increase for large max_tokens or extended thinking. Requires restart to change.
+request_timeout_secs = 300   # 5 minutes
+
+# Process pool for claude_code backend.
+# Caps the number of concurrent `claude` subprocesses so the OS isn't overwhelmed.
+# 0 = unlimited (not recommended).
+claude_code_max_concurrency    = 4   # max simultaneous claude processes
+# Seconds a request queues for a free slot before failing with a capacity error.
+claude_code_queue_timeout_secs = 30
 
 [local]
 enabled      = true
@@ -24,30 +48,79 @@ dimensions  = 768
 
 [cache]
 db_path      = "claude-cache.db"
-max_size_mb  = 500
-default_ttl_secs = 604800  # 7 days
+max_size_mb  = 51200 # 50 GB
+default_ttl_secs = 2592000  # 30 days
 
 [cache.domain_ttl]
-rust       = 604800   # 7 days
-python     = 604800
-javascript = 259200   # 3 days
-typescript = 259200
-sql        = 604800
-shell      = 86400    # 1 day
+rust       = 2592000  
+python     = 2592000
+javascript = 2592000  
+typescript = 2592000
+sql        = 2592000
+shell      = 2592000  
 assembly   = 2592000  # 30 days
-general    = 604800
+general    = 2592000
 
 [routing]
 novelty_threshold     = 0.60
 complexity_threshold  = 0.40
 consequence_threshold = 0.30
+# Draft-verify makes a second API call for near-miss cache entries.
+# Disable when on a low-tier API key to reduce rate-limit pressure.
+draft_verify_enabled  = false
 
 [budget]
+# Set to false when running on a Pro/Max subscription — disables spend gate and recording.
+# Hot-reloadable: change here and it takes effect on the next request without a restart.
+enabled          = false
 db_path          = "claude-cache.budget.db"
 daily_limit_usd  = 0.50
 warn_at_pct      = 80
 input_per_1k_usd  = 0.003
 output_per_1k_usd = 0.015
+
+# ── Organic learning (Layer 1: few-shot context injection) ─────────────────────
+# When a request reaches the local Ollama model, the proxy looks up the top-K
+# most semantically similar prior Q&A pairs from the cache (in the same domain,
+# below the cache-serve threshold) and injects them as prior conversation turns.
+# The local model answers with the benefit of Claude's prior answers on similar
+# prompts — no offline training required.
+[learning]
+enabled          = true   # set false to disable injection (local model gets raw prompts)
+fewshot_k        = 3      # max examples to inject per request
+min_sim          = 0.65   # minimum similarity to qualify (below embedding.sim_threshold)
+max_answer_chars = 1500   # truncate long answers to keep context manageable
+# Layer 2: background distillation of cache entries into domain knowledge documents.
+# After distill_min_entries entries accumulate for a domain, the distiller asks the
+# local model to synthesize them into a reference doc injected before every local call.
+distill_enabled       = true
+distill_interval_secs = 3600  # run sweep hourly
+distill_min_entries   = 10    # minimum entries before distilling a domain
+distill_source_limit  = 20    # max entries to feed into one distillation
+# Layer 3: adaptive routing thresholds.
+# Watches the routing log for per-domain escalation rates and adjusts the
+# novelty threshold so the gate routes more/less traffic locally as the
+# local model learns from Layers 1 and 2.
+adapt_enabled        = true
+adapt_interval_secs  = 900    # check every 15 minutes
+adapt_window_secs    = 86400  # look back 24 hours
+adapt_min_samples    = 20     # minimum routed samples before adapting
+adapt_high_water     = 0.70   # raise threshold above this escalation rate
+adapt_low_water      = 0.25   # lower threshold below this escalation rate
+adapt_step           = 0.05   # how much to move threshold per step
+# Layer 4: explicit quality feedback from ![good]/![bad] annotations.
+# How heavily each explicit signal weighs against routing-based escalation counts.
+# 2.0 = each ![bad] counts as 2 routing failures; ![good] offsets 2 failures.
+# Set to 0 to ignore explicit feedback and rely on escalation rate alone.
+adapt_feedback_weight = 2.0
+# Layer 5: contrastive failure learning.
+# When the local model attempts a prompt but confidence is below the floor, the
+# attempt and the correct API response are stored as a contrast pair.  These
+# pairs are fed into the distillation synthesis prompt so the local model learns
+# not just what good answers look like but specifically what to avoid.
+contrast_enabled      = true   # record contrast pairs at escalation time
+contrast_in_fewshot   = false  # inject one contrast pair per domain into few-shot
+contrast_source_limit = 5      # max contrast pairs per domain in distillation
 
 # ── Node role ─────────────────────────────────────────────────────────────────
 # role:               "client" (default) or "cnc"

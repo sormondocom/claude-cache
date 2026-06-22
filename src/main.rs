@@ -8,7 +8,7 @@ use tracing::info;
 
 use claude_cache::{
     auth,
-    backend::{AnthropicBackend, ModelBackend, OllamaBackend},
+    backend::{AnthropicBackend, ClaudeCodeBackend, ModelBackend, OllamaBackend},
     budget::BudgetLedger,
     cache::CacheStore,
     config::{AppConfig, NodeRole},
@@ -16,6 +16,7 @@ use claude_cache::{
     federation::{AnnouncePayload, FederationClient},
     health,
     identity::NodeIdentity,
+    learning::{CalibrationMap, CalibrationRunner, Distiller, ForgettingCurveWorker, ThresholdAdaptor, ThresholdMap},
     router::Router,
     server::{AppState, build_router},
     trust::TrustStore,
@@ -46,6 +47,22 @@ struct Cli {
     #[arg(long)]
     cnc_node_id: Option<String>,
 
+    /// Override cache database path (overrides config.toml cache.db_path)
+    #[arg(long)]
+    cache_db: Option<String>,
+
+    /// Override budget database path (overrides config.toml budget.db_path)
+    #[arg(long)]
+    budget_db: Option<String>,
+
+    /// Path to the trust/federation database
+    #[arg(long, default_value = "claude-cache.trust.db", global = true)]
+    trust_db: String,
+
+    /// Path to the node identity key file
+    #[arg(long, default_value = "node_identity.key", global = true)]
+    key_file: String,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -54,11 +71,7 @@ struct Cli {
 enum Command {
     /// Print this node's stable Ed25519 fingerprint and public key, then exit.
     /// Run this on any node to get the value to put in a peer's config.toml.
-    Identity {
-        /// Path to key file (default: node_identity.key)
-        #[arg(long, default_value = "node_identity.key")]
-        key_file: String,
-    },
+    Identity,
 }
 
 // ── Counter-signature persistence ──────────────────────────────────────────────
@@ -92,14 +105,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Identity { key_file }) => {
-            let id = NodeIdentity::load_or_generate(&key_file)?;
+        Some(Command::Identity) => {
+            let id = NodeIdentity::load_or_generate(&cli.key_file)?;
             println!("fingerprint: {}", id.fingerprint);
             println!("public_key:  {}", id.public_key_hex);
             return Ok(());
         }
         None => {
-            run_server(cli.config, cli.role, cli.cnc_url, cli.cnc_node_id).await
+            run_server(
+                cli.config,
+                cli.role,
+                cli.cnc_url,
+                cli.cnc_node_id,
+                cli.cache_db,
+                cli.budget_db,
+                cli.trust_db,
+                cli.key_file,
+            ).await
         }
     }
 }
@@ -111,6 +133,10 @@ async fn run_server(
     role_override: Option<String>,
     cnc_url_override: Option<String>,
     cnc_node_id_override: Option<String>,
+    cache_db_override: Option<String>,
+    budget_db_override: Option<String>,
+    trust_db: String,
+    key_file: String,
 ) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -133,18 +159,39 @@ async fn run_server(
     }
     if let Some(url) = cnc_url_override     { cfg.node.cnc_url     = url; }
     if let Some(nid) = cnc_node_id_override { cfg.node.cnc_node_id = nid; }
+    if let Some(p)   = cache_db_override    { cfg.cache.db_path    = p; }
+    if let Some(p)   = budget_db_override   { cfg.budget.db_path   = p; }
+
+    if let Err(e) = cfg.validate() {
+        tracing::error!("invalid configuration: {e}");
+        std::process::exit(1);
+    }
 
     let cfg = Arc::new(ArcSwap::new(Arc::new(cfg)));
     let is_cnc = cfg.load().node.role == NodeRole::Cnc;
 
     // ── Node identity ─────────────────────────────────────────────────────
-    let identity = Arc::new(NodeIdentity::load_or_generate("node_identity.key")?);
+    let identity = Arc::new(NodeIdentity::load_or_generate(&key_file)?);
     info!("node fingerprint: {}", &identity.fingerprint[..16]);
     info!("public key:       {}", identity.public_key_hex);
     if is_cnc { info!("role: CNC (head node)"); } else { info!("role: client"); }
 
     // ── Credentials ───────────────────────────────────────────────────────
     let creds = auth::load()?;
+
+    {
+        let initial = creds.get();
+        if initial.is_oauth_token() {
+            // OAuth tokens (sk-ant-oat…) from Claude Pro/Max — these do not
+            // grant direct REST API access; the auto-detection above will have
+            // already selected claude_code.  Log for operator visibility only.
+            info!("credentials: Claude.ai OAuth token (Pro/Max)");
+        } else if initial.is_api_key() {
+            info!("credentials: direct API key");
+        } else {
+            info!("credentials: loaded (unknown type)");
+        }
+    }
 
     // Snapshot for startup use — these fields seed one-time-init structs and
     // are safe to read once; the live config is accessed via cfg.load() later.
@@ -153,7 +200,7 @@ async fn run_server(
     // ── Stores ────────────────────────────────────────────────────────────
     let cache  = Arc::new(CacheStore::open(&c.cache.db_path, &identity.fingerprint).await?);
     let budget = Arc::new(BudgetLedger::open(c.budget.clone()).await?);
-    let trust  = Arc::new(TrustStore::open("claude-cache.trust.db", &identity.fingerprint).await?);
+    let trust  = Arc::new(TrustStore::open(&trust_db, &identity.fingerprint).await?);
 
     let our_url = format!("http://{}:{}", c.server.host, c.server.port);
 
@@ -211,10 +258,40 @@ async fn run_server(
 
     // ── Backends ──────────────────────────────────────────────────────────
     let anthropic = Arc::new(AnthropicBackend::new(&c.api, creds.clone()));
+    // NOTE: `creds` is a CredentialStore (Arc-backed) — cloning it shares the
+    // same inner ArcSwap, so the watcher below and AnthropicBackend always see
+    // the same value after a reload.
     let ollama    = Arc::new(OllamaBackend::new(&c.local));
 
-    let local_backend: Arc<dyn ModelBackend> = ollama;
-    let api_backend:   Arc<dyn ModelBackend> = anthropic.clone();
+    let local_backend: Arc<dyn ModelBackend> = ollama.clone();
+
+    // Auto-select claude_code when no ANTHROPIC_API_KEY is present in the
+    // environment.  Direct API access requires a real key; OAuth tokens from
+    // ~/.claude/.credentials.json only work with the CLI subprocess path.
+    let has_api_key = std::env::var("ANTHROPIC_API_KEY").is_ok();
+    let use_claude_code = !has_api_key || c.api.backend == "claude_code";
+
+    let api_backend: Arc<dyn ModelBackend> = if use_claude_code {
+        let reason = if !has_api_key {
+            "no ANTHROPIC_API_KEY — auto-selected claude_code backend"
+        } else {
+            "api.backend = \"claude_code\" in config"
+        };
+        info!(
+            "API backend: claude_code subprocess ({reason}, \
+             max_concurrency={mc}, queue_timeout={qt}s)",
+            mc = c.api.claude_code_max_concurrency,
+            qt = c.api.claude_code_queue_timeout_secs,
+        );
+        Arc::new(ClaudeCodeBackend::new(
+            c.api.request_timeout_secs,
+            c.api.claude_code_max_concurrency,
+            c.api.claude_code_queue_timeout_secs,
+        ))
+    } else {
+        info!("API backend: anthropic direct HTTPS (API key present)");
+        anthropic.clone()
+    };
 
     // ── Federation ────────────────────────────────────────────────────────
     let federation = Arc::new(FederationClient::new(
@@ -225,13 +302,18 @@ async fn run_server(
     ));
 
     // ── Router ────────────────────────────────────────────────────────────
+    let thresholds  = Arc::new(ArcSwap::new(Arc::new(ThresholdMap::new())));
+    let calibration = Arc::new(ArcSwap::new(Arc::new(CalibrationMap::new())));
+
     let router = Router::new(
         cfg.clone(),
         cache.clone(),
         budget.clone(),
         embedder,
-        local_backend,
+        local_backend.clone(),
         api_backend,
+        thresholds.clone(),
+        calibration.clone(),
     ).with_federation(federation.clone());
 
     // ── Startup: pull revocations from known peers ────────────────────────
@@ -250,8 +332,9 @@ async fn run_server(
     if c.federation.enabled && !c.federation.peers.is_empty() {
         let fed_boot  = federation.clone();
         let peer_urls: Vec<String> = c.federation.peers.iter().map(|p| p.url.clone()).collect();
+        let boot_delay = c.node.bootstrap_delay_secs;
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(boot_delay)).await;
             for url in &peer_urls {
                 fed_boot.exchange_peers(url).await;
             }
@@ -263,10 +346,11 @@ async fn run_server(
         let identity_b = identity.clone();
         let cache_b    = cache.clone();
         let our_url_b  = our_url.clone();
+        let cnc_delay = c.node.cnc_announce_delay_secs;
         tokio::spawn(async move {
             // Small delay — let the server start binding before CNC tries to
             // contact us back.
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(cnc_delay)).await;
 
             let hashes = cache_b.list_shared_hashes(500, 0).await.unwrap_or_default();
 
@@ -318,13 +402,58 @@ async fn run_server(
         });
     }
 
+    // ── Background: domain knowledge distillation (Layer 2 learning) ─────
+    // Periodically synthesizes high-hit cache entries into per-domain knowledge
+    // documents that are injected as system prompt context for local model calls.
+    // The Arc is also stored in AppState so the management endpoint can trigger
+    // on-demand distillation without re-creating the worker.
+    // Always spawn the distiller — the loop reads distill_enabled from live config
+    // on each tick, so it can be toggled via hot-reload without a restart.
+    let distiller = Arc::new(
+        Distiller::new(cache.clone(), cfg.clone(), local_backend.clone())
+            .with_federation(federation.clone())
+    );
+    {
+        let d = (*distiller).clone();
+        tokio::spawn(async move { d.run().await });
+    }
+
+    // ── Background: adaptive routing thresholds (Layer 3 learning) ───────
+    // Watches escalation rates per domain/intent and tightens or relaxes the
+    // novelty routing threshold so the gate self-calibrates as the local model
+    // accumulates knowledge from Layers 1 and 2.
+    {
+        let adaptor = ThresholdAdaptor::new(cache.clone(), cfg.clone(), thresholds.clone());
+        tokio::spawn(async move { adaptor.run().await });
+    }
+
+    // ── Background: forgetting curves (dynamic cache TTL) ────────────────────
+    // Every 6 hours: adjusts expires_at on non-pinned cache entries based on
+    // usage frequency (hit_count) and recency (last_hit_at).  Popular entries
+    // live up to 8× longer; stale entries fade and expire naturally.
+    {
+        let forgetter = ForgettingCurveWorker::new(cache.clone(), cfg.clone());
+        tokio::spawn(async move { forgetter.run().await });
+    }
+
+    // ── Background: confidence calibration (Layer 6 learning) ─────────────
+    // Hourly: samples API cache entries, replays them through the local model,
+    // measures actual accuracy vs. claimed confidence, and builds a per-domain
+    // correction bias that the router applies before the confidence floor gate.
+    {
+        let calibrator = CalibrationRunner::new(
+            cache.clone(), cfg.clone(), local_backend.clone(), calibration.clone(),
+        );
+        tokio::spawn(async move { calibrator.run().await });
+    }
+
     // ── Background: eviction + gossip + revocation sync ───────────────────
     {
-        let evict_cache    = cache.clone();
-        let fed            = federation.clone();
-        let trust_bg       = trust.clone();
-        let bg_url         = our_url.clone();
-        let max_size_bytes = c.cache.max_size_mb * 1024 * 1024;
+        let evict_cache = cache.clone();
+        let fed         = federation.clone();
+        let trust_bg    = trust.clone();
+        let bg_url      = our_url.clone();
+        let evict_cfg   = cfg.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
@@ -332,6 +461,7 @@ async fn run_server(
                 if let Ok(n) = evict_cache.evict_expired().await {
                     if n > 0 { info!("evicted {n} expired cache entries"); }
                 }
+                let max_size_bytes = evict_cfg.load().cache.max_size_mb * 1024 * 1024;
                 match evict_cache.evict_to_size_limit(max_size_bytes).await {
                     Ok(n) if n > 0 => info!("size-limit eviction: removed {n} LRU entries"),
                     Err(e)         => tracing::warn!("size-limit eviction error: {e}"),
@@ -378,11 +508,46 @@ async fn run_server(
                 if current.is_some() && current != last_mtime {
                     last_mtime = current;
                     match AppConfig::load(&watch_path) {
-                        Ok(new_cfg) => {
-                            watch_cfg.store(Arc::new(new_cfg));
-                            info!("config auto-reloaded from {watch_path}");
+                        Ok(mut new_cfg) => {
+                            if let Err(e) = new_cfg.validate() {
+                                tracing::warn!("config reload skipped — validation failed: {e}");
+                            } else {
+                                let old = watch_cfg.load();
+                                new_cfg.cache.db_path  = old.cache.db_path.clone();
+                                new_cfg.budget.db_path = old.budget.db_path.clone();
+                                watch_cfg.store(Arc::new(new_cfg));
+                                info!("config auto-reloaded from {watch_path}");
+                            }
                         }
                         Err(e) => tracing::warn!("config auto-reload failed: {e}"),
+                    }
+                }
+            }
+        });
+    }
+
+    // ── Background: credentials.json mtime watcher (OAuth token rotation) ───
+    // Claude Code rotates OAuth tokens automatically (~hourly).  Poll every 30s
+    // so we pick up a fresh token well before any in-flight request hits a 401.
+    // On mtime change we swap in new credentials; the 401-retry path in
+    // AnthropicBackend is a belt-and-suspenders safety net for the gap between
+    // rotation and the next watcher tick.
+    {
+        let watch_creds = creds.clone();
+        tokio::spawn(async move {
+            let Some(creds_path) = auth::CredentialStore::credentials_path() else { return; };
+            let mut last_mtime = std::fs::metadata(&creds_path).ok()
+                .and_then(|m| m.modified().ok());
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let current = std::fs::metadata(&creds_path).ok()
+                    .and_then(|m| m.modified().ok());
+                if current.is_some() && current != last_mtime {
+                    last_mtime = current;
+                    match watch_creds.reload() {
+                        Ok(()) => info!("credentials reloaded (OAuth token rotated)"),
+                        Err(e) => tracing::warn!("credential reload failed: {e}"),
                     }
                 }
             }
@@ -396,7 +561,6 @@ async fn run_server(
     let auto_promo = c.node.auto_promote_peers;
     let drain_secs = c.limits.shutdown_timeout_secs;
     let fed_enabled = c.federation.enabled;
-    let rpm_limit   = c.limits.messages_per_minute;
     // Drop the startup snapshot — AppState holds cfg for runtime reads.
     drop(c);
 
@@ -418,6 +582,14 @@ async fn run_server(
         portal_token,
         rate_limit_rpm:      rate_limit,
         credits_exhausted:   AtomicBool::new(false),
+        manual_bypass:       AtomicBool::new(false),
+        distiller,
+        graph_cache:         tokio::sync::Mutex::new(None),
+        http_client:         reqwest::Client::builder()
+                                 .use_rustls_tls()
+                                 .timeout(std::time::Duration::from_secs(300))
+                                 .build()
+                                 .expect("http client"),
     });
 
     let app      = build_router(state);
@@ -445,6 +617,8 @@ async fn run_server(
     info!("  POST  http://{addr}/api/pricing");
     info!("  POST  http://{addr}/api/config/reload");
     info!("  POST  http://{addr}/api/credits/reset");
+    info!("  POST  http://{addr}/api/bypass/enable");
+    info!("  POST  http://{addr}/api/bypass/disable");
     info!("  GET   http://{addr}/api/trust");
     info!("  GET   http://{addr}/api/peers/health");
     info!("  GET   http://{addr}/api/routing");
@@ -453,6 +627,13 @@ async fn run_server(
     info!("  POST  http://{addr}/v1/cache/seed");
     info!("  POST  http://{addr}/v1/cache/entries/:id/pin");
     info!("  DELETE http://{addr}/v1/cache/entries/:id");
+    info!("─── learning ────────────────────────────────────────────");
+    info!("  GET   http://{addr}/api/learning/knowledge   (domain knowledge docs)");
+    info!("  GET   http://{addr}/api/learning/thresholds  (adaptive routing overrides)");
+    info!("  GET   http://{addr}/api/learning/feedback    (quality feedback signals)");
+    info!("  GET   http://{addr}/api/learning/contrasts   (escalation contrast pairs)");
+    info!("  GET   http://{addr}/api/learning/brain       (aggregate brain growth snapshot)");
+    info!("  POST  http://{addr}/api/learning/distill/:domain  (manual distillation trigger)");
     if is_cnc {
         info!("─── trust / eviction (CNC) ──────────────────────────────");
         info!("  GET   http://{addr}/v1/trust");
@@ -460,8 +641,8 @@ async fn run_server(
         info!("  POST  http://{addr}/v1/evict/:node_id");
     }
     info!("─────────────────────────────────────────────────────────");
-    if rpm_limit > 0 {
-        info!("rate limit: {} req/min on POST /v1/messages", rpm_limit);
+    if rate_limit > 0 {
+        info!("rate limit: {} req/min on POST /v1/messages", rate_limit);
     }
 
     // Wait for SIGTERM/Ctrl+C, then give in-flight requests up to drain_secs

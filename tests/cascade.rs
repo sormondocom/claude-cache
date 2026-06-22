@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tempfile::tempdir;
 
@@ -16,6 +17,7 @@ use claude_cache::{
     domain::ShapeKey,
     embedding::StubEmbedder,
     identity::NodeIdentity,
+    learning::{CalibrationMap, ThresholdMap},
     router::{RouteDecision, Router},
 };
 
@@ -38,13 +40,13 @@ impl MockBackend {
 
 #[async_trait]
 impl ModelBackend for MockBackend {
-    async fn complete(&self, req: &MessagesRequest) -> Result<BackendResult> {
+    async fn complete(&self, _req: &MessagesRequest) -> Result<BackendResult> {
         Ok(BackendResult {
             response: MessagesResponse {
                 id:          "test-id".into(),
                 kind:        "message".into(),
                 role:        "assistant".into(),
-                content:     vec![ContentBlock { kind: "text".into(), text: Some(self.text.into()) }],
+                content:     vec![ContentBlock { kind: "text".into(), text: Some(self.text.into()), extra: Default::default() }],
                 model:       self.name_str.into(),
                 stop_reason: Some("end_turn".into()),
                 usage:       Usage { input_tokens: 10, output_tokens: 20 },
@@ -54,6 +56,19 @@ impl ModelBackend for MockBackend {
         })
     }
     fn name(&self) -> &'static str { self.name_str }
+}
+
+/// A backend that always returns an error.  Used to test escalation paths.
+struct FailingBackend {
+    err_msg: &'static str,
+}
+
+#[async_trait]
+impl ModelBackend for FailingBackend {
+    async fn complete(&self, _req: &MessagesRequest) -> Result<BackendResult> {
+        Err(anyhow::anyhow!("{}", self.err_msg))
+    }
+    fn name(&self) -> &'static str { "mock-failing" }
 }
 
 // ── Test environment helpers ──────────────────────────────────────────────────
@@ -76,6 +91,7 @@ impl Env {
 
         let cache  = Arc::new(CacheStore::open(&cache_path, &id.fingerprint).await.unwrap());
         let bcfg   = BudgetConfig {
+            enabled:           true,
             db_path:           budget_path,
             daily_limit_usd:   10.0,
             warn_at_pct:       80,
@@ -91,35 +107,39 @@ impl Env {
     /// Build a Router that always routes locally (thresholds all 1.0).
     fn router_force_local(&self, local_confidence: f64) -> Router {
         let mut cfg = (*self.cfg).clone();
-        cfg.routing = RoutingConfig { novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0 };
+        cfg.routing = RoutingConfig { novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0, draft_verify_enabled: false, draft_verify_min_sim: 0.65 };
         cfg.local.confidence_floor = local_confidence;
         cfg.local.enabled = true;
         cfg.embedding.enabled = false; // stub only in tests
 
         Router::new(
-            Arc::new(cfg),
+            Arc::new(ArcSwap::from_pointee(cfg)),
             self.cache.clone(),
             self.budget.clone(),
             Arc::new(StubEmbedder::new(64)),
             Arc::new(MockBackend::local("local answer", 0.90)),
             Arc::new(MockBackend::api("api answer")),
+            Arc::new(ArcSwap::from_pointee(ThresholdMap::new())),
+            Arc::new(ArcSwap::from_pointee(CalibrationMap::new())),
         )
     }
 
     /// Build a Router that always routes to API (thresholds all 0.0).
     fn router_force_api(&self) -> Router {
         let mut cfg = (*self.cfg).clone();
-        cfg.routing = RoutingConfig { novelty_threshold: 0.0, complexity_threshold: 0.0, consequence_threshold: 0.0 };
+        cfg.routing = RoutingConfig { novelty_threshold: 0.0, complexity_threshold: 0.0, consequence_threshold: 0.0, draft_verify_enabled: false, draft_verify_min_sim: 0.65 };
         cfg.local.enabled = true;
         cfg.embedding.enabled = false;
 
         Router::new(
-            Arc::new(cfg),
+            Arc::new(ArcSwap::from_pointee(cfg)),
             self.cache.clone(),
             self.budget.clone(),
             Arc::new(StubEmbedder::new(64)),
             Arc::new(MockBackend::local("local answer", 0.90)),
             Arc::new(MockBackend::api("api answer")),
+            Arc::new(ArcSwap::from_pointee(ThresholdMap::new())),
+            Arc::new(ArcSwap::from_pointee(CalibrationMap::new())),
         )
     }
 
@@ -137,25 +157,28 @@ impl Env {
         cfg.local.enabled = true;
         cfg.embedding.enabled = false;
         Router::new(
-            Arc::new(cfg),
+            Arc::new(ArcSwap::from_pointee(cfg)),
             self.cache.clone(),
             self.budget.clone(),
             Arc::new(StubEmbedder::new(64)),
             Arc::new(local),
             Arc::new(api),
+            Arc::new(ArcSwap::from_pointee(ThresholdMap::new())),
+            Arc::new(ArcSwap::from_pointee(CalibrationMap::new())),
         )
     }
 }
 
 fn user_req(text: &str) -> MessagesRequest {
     MessagesRequest {
-        model:      "claude-sonnet-4-6".into(),
-        messages:   vec![Message { role: "user".into(), content: MessageContent::Text(text.into()) }],
-        max_tokens: 1024,
-        system:     None,
-        stream:     None,
-        tools:      None,
-        extra:      Default::default(),
+        model:          "claude-sonnet-4-6".into(),
+        messages:       vec![Message { role: "user".into(), content: MessageContent::Text(text.into()) }],
+        max_tokens:     1024,
+        system:         None,
+        stream:         None,
+        tools:          None,
+        extra:          Default::default(),
+        anthropic_beta: None,
     }
 }
 
@@ -194,7 +217,7 @@ async fn local_model_low_confidence_escalates_to_api() {
     let env = Env::new().await;
     // Force routing gate open (always try local), but local returns confidence 0.5 < floor 0.8
     let router = env.router_with(
-        RoutingConfig { novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0 },
+        RoutingConfig { novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0, draft_verify_enabled: false, draft_verify_min_sim: 0.65 },
         0.80,
         MockBackend::local("weak answer", 0.50), // below floor
         MockBackend::api("strong api answer"),
@@ -246,7 +269,7 @@ async fn cache_hit_returns_saved_response() {
         id:          "cached-id".into(),
         kind:        "message".into(),
         role:        "assistant".into(),
-        content:     vec![ContentBlock { kind: "text".into(), text: Some("ownership means one owner".into()) }],
+        content:     vec![ContentBlock { kind: "text".into(), text: Some("ownership means one owner".into()), extra: Default::default() }],
         model:       "anthropic".into(),
         stop_reason: Some("end_turn".into()),
         usage:       Usage { input_tokens: 5, output_tokens: 10 },
@@ -269,19 +292,21 @@ async fn budget_ceiling_forces_local_over_api() {
 
     // Set a zero budget so the first API call exhausts it
     let mut cfg = (*env.cfg).clone();
-    cfg.routing = RoutingConfig { novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0 };
+    cfg.routing = RoutingConfig { novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0, draft_verify_enabled: false, draft_verify_min_sim: 0.65 };
     cfg.local.confidence_floor = 0.0; // accept any local confidence
     cfg.local.enabled = true;
     cfg.embedding.enabled = false;
     cfg.budget.daily_limit_usd = 0.0; // already exceeded
 
     let router = Router::new(
-        Arc::new(cfg),
+        Arc::new(ArcSwap::from_pointee(cfg)),
         env.cache.clone(),
         env.budget.clone(),
         Arc::new(StubEmbedder::new(64)),
         Arc::new(MockBackend::local("local fallback", 0.50)),
         Arc::new(MockBackend::api("api answer")),
+        Arc::new(ArcSwap::from_pointee(ThresholdMap::new())),
+        Arc::new(ArcSwap::from_pointee(CalibrationMap::new())),
     );
 
     let req = user_req("write me a web server in Rust");
@@ -295,7 +320,7 @@ async fn routing_gate_high_consequence_forces_api() {
     let env    = Env::new().await;
     // Use default thresholds — "review" intent has consequence=0.70 which exceeds default 0.30
     let router = env.router_with(
-        RoutingConfig { novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 0.30 },
+        RoutingConfig { novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 0.30, draft_verify_enabled: false, draft_verify_min_sim: 0.65 },
         0.0,
         MockBackend::local("local review", 0.99),
         MockBackend::api("api review"),
@@ -336,6 +361,76 @@ async fn streaming_request_flag_does_not_break_routing() {
     let r = router.route(&req).await.unwrap();
     // Should still route correctly (stream=true goes through the same cascade in non-stream mode)
     assert!(matches!(r.decision, RouteDecision::Api | RouteDecision::ExactCache | RouteDecision::LocalModel));
+}
+
+// ── Error-path cascade tests ──────────────────────────────────────────────────
+
+/// When the local model returns an error (not low confidence, but a crash/IO failure),
+/// the router must escalate to the API backend and serve its response.
+#[tokio::test]
+async fn local_model_error_escalates_to_api() {
+    let env = Env::new().await;
+    let router = env.router_with(
+        RoutingConfig {
+            novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0,
+            draft_verify_enabled: false, draft_verify_min_sim: 0.65,
+        },
+        0.0, // confidence floor
+        FailingBackend { err_msg: "local model crashed" },
+        MockBackend::api("api fallback answer"),
+    );
+
+    let req = user_req("explain Rust borrow rules");
+    let r   = router.route(&req).await.unwrap();
+
+    assert_eq!(r.decision, RouteDecision::Api,
+        "local model error must escalate to API");
+    assert_eq!(r.response.text_content(), "api fallback answer");
+}
+
+/// When both the local model and API backend fail, the error propagates
+/// out of route() as an anyhow::Error (callers must handle it).
+#[tokio::test]
+async fn both_backends_fail_propagates_error() {
+    let env = Env::new().await;
+    let router = env.router_with(
+        RoutingConfig {
+            novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0,
+            draft_verify_enabled: false, draft_verify_min_sim: 0.65,
+        },
+        0.0,
+        FailingBackend { err_msg: "local crashed" },
+        FailingBackend { err_msg: "api crashed" },
+    );
+
+    let req    = user_req("what is a mutex");
+    let result = router.route(&req).await;
+
+    assert!(result.is_err(), "both backends failing must propagate an error");
+    if let Err(e) = result {
+        assert!(!e.to_string().is_empty(), "error message must not be empty");
+    }
+}
+
+/// When the local model returns Ok but with confidence below the floor, AND
+/// the API also fails, the router surfaces the API error to the caller.
+#[tokio::test]
+async fn low_confidence_local_then_api_fail_propagates_error() {
+    let env = Env::new().await;
+    let router = env.router_with(
+        RoutingConfig {
+            novelty_threshold: 1.0, complexity_threshold: 1.0, consequence_threshold: 1.0,
+            draft_verify_enabled: false, draft_verify_min_sim: 0.65,
+        },
+        0.90, // floor: local returns 0.5 < 0.90 → escalates
+        MockBackend::local("weak answer", 0.50),
+        FailingBackend { err_msg: "api also down" },
+    );
+
+    let req    = user_req("write an async runtime in Rust from scratch");
+    let result = router.route(&req).await;
+
+    assert!(result.is_err(), "low-confidence local + API failure must propagate an error");
 }
 
 // ── Domain classification tests ───────────────────────────────────────────────
@@ -479,13 +574,13 @@ async fn system_prompt_isolates_cache_entries() {
 
     let resp_a = serde_json::to_string(&MessagesResponse {
         id: "a".into(), kind: "message".into(), role: "assistant".into(),
-        content: vec![ContentBlock { kind: "text".into(), text: Some("strict answer".into()) }],
+        content: vec![ContentBlock { kind: "text".into(), text: Some("strict answer".into()), extra: Default::default() }],
         model: "anthropic".into(), stop_reason: Some("end_turn".into()),
         usage: Usage { input_tokens: 5, output_tokens: 10 },
     }).unwrap();
     let resp_b = serde_json::to_string(&MessagesResponse {
         id: "b".into(), kind: "message".into(), role: "assistant".into(),
-        content: vec![ContentBlock { kind: "text".into(), text: Some("friendly answer".into()) }],
+        content: vec![ContentBlock { kind: "text".into(), text: Some("friendly answer".into()), extra: Default::default() }],
         model: "anthropic".into(), stop_reason: Some("end_turn".into()),
         usage: Usage { input_tokens: 5, output_tokens: 10 },
     }).unwrap();
@@ -511,7 +606,7 @@ async fn pinned_entry_survives_eviction() {
 
     let make_resp = |id: &str, text: &str| serde_json::to_string(&MessagesResponse {
         id: id.into(), kind: "message".into(), role: "assistant".into(),
-        content: vec![ContentBlock { kind: "text".into(), text: Some(text.into()) }],
+        content: vec![ContentBlock { kind: "text".into(), text: Some(text.into()), extra: Default::default() }],
         model: "anthropic".into(), stop_reason: Some("end_turn".into()),
         usage: Usage { input_tokens: 5, output_tokens: 10 },
     }).unwrap();
@@ -541,7 +636,7 @@ async fn search_entries_returns_matching_results() {
 
     let dummy_resp = |text: &str| serde_json::to_string(&MessagesResponse {
         id: "x".into(), kind: "message".into(), role: "assistant".into(),
-        content: vec![ContentBlock { kind: "text".into(), text: Some(text.into()) }],
+        content: vec![ContentBlock { kind: "text".into(), text: Some(text.into()), extra: Default::default() }],
         model: "anthropic".into(), stop_reason: Some("end_turn".into()),
         usage: Usage { input_tokens: 5, output_tokens: 10 },
     }).unwrap();

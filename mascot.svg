@@ -1,0 +1,255 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500">
+  <defs>
+    <radialGradient id="screenGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#004400"/>
+      <stop offset="70%" stop-color="#002200"/>
+      <stop offset="100%" stop-color="#000d00"/>
+    </radialGradient>
+    <radialGradient id="bgThreat" cx="82%" cy="55%" r="42%">
+      <stop offset="0%" stop-color="#2a0000" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#0d0d1a" stop-opacity="1"/>
+    </radialGradient>
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="redGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="500" fill="url(#bgThreat)"/>
+
+  <!-- Floor -->
+  <rect x="0" y="422" width="800" height="78" fill="#080810"/>
+  <line x1="0" y1="422" x2="800" y2="422" stroke="#1a1a2e" stroke-width="1.5"/>
+  <!-- Floor tile grid -->
+  <line x1="0" y1="444" x2="800" y2="444" stroke="#111120" stroke-width="1"/>
+  <line x1="0" y1="466" x2="800" y2="466" stroke="#111120" stroke-width="1"/>
+  <line x1="100" y1="422" x2="100" y2="500" stroke="#111120" stroke-width="1"/>
+  <line x1="200" y1="422" x2="200" y2="500" stroke="#111120" stroke-width="1"/>
+  <line x1="300" y1="422" x2="300" y2="500" stroke="#111120" stroke-width="1"/>
+  <line x1="400" y1="422" x2="400" y2="500" stroke="#111120" stroke-width="1"/>
+  <line x1="500" y1="422" x2="500" y2="500" stroke="#111120" stroke-width="1"/>
+  <line x1="600" y1="422" x2="600" y2="500" stroke="#111120" stroke-width="1"/>
+  <line x1="700" y1="422" x2="700" y2="500" stroke="#111120" stroke-width="1"/>
+
+  <!-- Motion speed lines (PC running left) -->
+  <g stroke="#252538" stroke-linecap="round" opacity="0.7">
+    <line x1="30" y1="245" x2="178" y2="240" stroke-width="2.5"/>
+    <line x1="18" y1="263" x2="174" y2="260" stroke-width="2.5"/>
+    <line x1="25" y1="281" x2="172" y2="280" stroke-width="2"/>
+    <line x1="38" y1="299" x2="175" y2="300" stroke-width="2"/>
+    <line x1="50" y1="316" x2="176" y2="318" stroke-width="1.5"/>
+    <line x1="60" y1="331" x2="174" y2="335" stroke-width="1.5"/>
+    <line x1="22" y1="228" x2="168" y2="223" stroke-width="1.5"/>
+  </g>
+
+  <!-- ===================== PC CHARACTER ===================== -->
+
+  <!-- PC shadow on floor -->
+  <ellipse cx="275" cy="428" rx="82" ry="10" fill="#000" opacity="0.45"/>
+
+  <!-- LEGS (behind torso) -->
+  <!-- Left leg (swinging back) -->
+  <line x1="248" y1="390" x2="218" y2="430" stroke="#b8b8a4" stroke-width="13" stroke-linecap="round"/>
+  <!-- Right leg (forward push) -->
+  <line x1="292" y1="390" x2="318" y2="430" stroke="#b8b8a4" stroke-width="13" stroke-linecap="round"/>
+  <!-- Left foot -->
+  <ellipse cx="214" cy="433" rx="22" ry="9" fill="#8a8878" transform="rotate(-28,214,433)"/>
+  <!-- Right foot -->
+  <ellipse cx="322" cy="433" rx="22" ry="9" fill="#8a8878" transform="rotate(22,322,433)"/>
+
+  <!-- TOWER PC (torso/body) -->
+  <rect x="222" y="306" width="112" height="90" rx="7" fill="#c8c8b4" stroke="#a8a894" stroke-width="2"/>
+  <!-- Top bevel strip -->
+  <rect x="228" y="311" width="100" height="13" rx="3" fill="#bcbca8" stroke="#9a9a86" stroke-width="1"/>
+  <!-- Drive bays x3 -->
+  <rect x="228" y="328" width="64" height="10" rx="2" fill="#aeae9a" stroke="#888874" stroke-width="1"/>
+  <rect x="228" y="341" width="64" height="10" rx="2" fill="#aeae9a" stroke="#888874" stroke-width="1"/>
+  <rect x="228" y="354" width="64" height="10" rx="2" fill="#aeae9a" stroke="#888874" stroke-width="1"/>
+  <!-- Power button -->
+  <circle cx="318" cy="337" r="8" fill="#302e28" stroke="#222018" stroke-width="2"/>
+  <circle cx="318" cy="337" r="5" fill="#484440"/>
+  <!-- Power LED (green, glowing) -->
+  <circle cx="306" cy="337" r="3.5" fill="#00ff55" filter="url(#softGlow)"/>
+
+  <!-- CRT MONITOR (head) -->
+  <!-- Outer housing -->
+  <rect x="178" y="128" width="202" height="182" rx="17" fill="#c8c8b4" stroke="#a8a894" stroke-width="2"/>
+  <!-- Side depth / CRT bulge hint -->
+  <path d="M376,140 Q404,158 404,218 Q404,272 376,284"
+        stroke="#a8a894" stroke-width="1.5" fill="#b0b09c" opacity="0.5"/>
+  <!-- Top vents -->
+  <line x1="215" y1="132" x2="215" y2="140" stroke="#9a9a86" stroke-width="2"/>
+  <line x1="224" y1="132" x2="224" y2="140" stroke="#9a9a86" stroke-width="2"/>
+  <line x1="233" y1="132" x2="233" y2="140" stroke="#9a9a86" stroke-width="2"/>
+  <line x1="242" y1="132" x2="242" y2="140" stroke="#9a9a86" stroke-width="2"/>
+  <!-- Screen bezel (dark plastic ring) -->
+  <rect x="194" y="144" width="172" height="136" rx="10" fill="#181818" stroke="#848470" stroke-width="1.5"/>
+  <!-- Screen surface -->
+  <rect x="201" y="151" width="158" height="122" rx="7" fill="url(#screenGlow)"/>
+
+  <!-- FACE ON SCREEN: big scared eyes and open mouth -->
+
+  <!-- Left eye white -->
+  <ellipse cx="240" cy="196" rx="21" ry="22" fill="white" stroke="#0d0d0d" stroke-width="1.5"/>
+  <!-- Right eye white -->
+  <ellipse cx="320" cy="196" rx="21" ry="22" fill="white" stroke="#0d0d0d" stroke-width="1.5"/>
+  <!-- Irises (looking hard right = toward the server in fear) -->
+  <circle cx="248" cy="198" r="12" fill="#5c3a18"/>
+  <circle cx="328" cy="198" r="12" fill="#5c3a18"/>
+  <!-- Pupils -->
+  <circle cx="249" cy="199" r="7.5" fill="#0d0d0d"/>
+  <circle cx="329" cy="199" r="7.5" fill="#0d0d0d"/>
+  <!-- Eye shine highlights -->
+  <circle cx="244" cy="193" r="3.5" fill="white" opacity="0.9"/>
+  <circle cx="324" cy="193" r="3.5" fill="white" opacity="0.9"/>
+  <circle cx="251" cy="201" r="1.5" fill="white" opacity="0.5"/>
+  <circle cx="331" cy="201" r="1.5" fill="white" opacity="0.5"/>
+
+  <!-- Fear eyebrows (angled: outer low, inner high = worry) -->
+  <path d="M222,174 Q241,168 258,172" stroke="#222" stroke-width="3" fill="none" stroke-linecap="round"/>
+  <path d="M302,172 Q319,168 338,174" stroke="#222" stroke-width="3" fill="none" stroke-linecap="round"/>
+
+  <!-- Open scared mouth -->
+  <ellipse cx="280" cy="250" rx="26" ry="20" fill="#1a0000" stroke="#0d0d0d" stroke-width="1.5"/>
+  <!-- Upper teeth -->
+  <rect x="263" y="238" width="12" height="10" rx="1.5" fill="#e8e8dc" stroke="#c8c8bc" stroke-width="0.5"/>
+  <rect x="277" y="238" width="12" height="10" rx="1.5" fill="#e8e8dc" stroke="#c8c8bc" stroke-width="0.5"/>
+  <rect x="291" y="238" width="12" height="10" rx="1.5" fill="#e8e8dc" stroke="#c8c8bc" stroke-width="0.5"/>
+  <!-- Lower teeth -->
+  <rect x="270" y="255" width="11" height="8" rx="1.5" fill="#e8e8dc" stroke="#c8c8bc" stroke-width="0.5"/>
+  <rect x="283" y="255" width="11" height="8" rx="1.5" fill="#e8e8dc" stroke="#c8c8bc" stroke-width="0.5"/>
+  <!-- Tongue -->
+  <ellipse cx="280" cy="258" rx="14" ry="8" fill="#cc3333"/>
+
+  <!-- Sweat drops (flying off right side, fear sweat) -->
+  <path d="M345,182 Q353,170 358,178 Q354,190 345,182" fill="#55aaee" opacity="0.85"/>
+  <path d="M352,204 Q361,191 367,200 Q362,212 352,204" fill="#55aaee" opacity="0.75"/>
+  <path d="M338,164 Q345,153 350,162 Q346,172 338,164" fill="#55aaee" opacity="0.65"/>
+
+  <!-- Monitor neck/stand -->
+  <rect x="250" y="308" width="58" height="16" rx="4" fill="#b8b8a4" stroke="#a0a090" stroke-width="1.5"/>
+  <!-- Monitor power LED -->
+  <circle cx="374" cy="296" r="4" fill="#00ff55" filter="url(#softGlow)"/>
+
+  <!-- ARMS -->
+  <!-- Left arm pumping forward (running, opposite the right arm) -->
+  <path d="M188,218 Q168,188 158,168" stroke="#c4c4b0" stroke-width="12"
+        stroke-linecap="round" fill="none"/>
+  <!-- Right arm pumping forward (running) -->
+  <path d="M380,218 Q412,252 404,298" stroke="#c4c4b0" stroke-width="12"
+        stroke-linecap="round" fill="none"/>
+
+
+
+  <!-- ===================== SERVER RACK MONSTER ===================== -->
+
+  <!-- Rack shadow on floor -->
+  <ellipse cx="660" cy="428" rx="92" ry="12" fill="#000" opacity="0.55"/>
+
+  <!-- Rack body (main metal enclosure) -->
+  <rect x="572" y="72" width="198" height="355" rx="9" fill="#1c1c1c" stroke="#404040" stroke-width="2.5"/>
+
+  <!-- Top and bottom rails / flanges -->
+  <rect x="572" y="72"  width="198" height="24" rx="9" fill="#282828" stroke="#484848" stroke-width="1.5"/>
+  <rect x="572" y="403" width="198" height="24" rx="9" fill="#282828" stroke="#484848" stroke-width="1.5"/>
+
+  <!-- Mounting rail strips on sides -->
+  <rect x="572" y="80"  width="16" height="338" rx="3" fill="#303030" stroke="#484848" stroke-width="1"/>
+  <rect x="754" y="80"  width="16" height="338" rx="3" fill="#303030" stroke="#484848" stroke-width="1"/>
+
+  <!-- Server blades / rack units (17 units, y from 100 to 396) -->
+  <rect x="591" y="100" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="120" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="140" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="160" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="180" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="200" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="220" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="240" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="260" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="280" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="300" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="320" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="340" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="360" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+  <rect x="591" y="380" width="162" height="17" rx="2" fill="#222" stroke="#363636" stroke-width="1"/>
+
+  <!-- Status LEDs on each blade -->
+  <circle cx="604" cy="108" r="3.5" fill="#ff2222" filter="url(#softGlow)"/>
+  <circle cx="604" cy="128" r="3.5" fill="#22ff22" filter="url(#softGlow)"/>
+  <circle cx="604" cy="148" r="3.5" fill="#ff2222" filter="url(#softGlow)"/>
+  <circle cx="604" cy="168" r="3.5" fill="#ffcc00" filter="url(#softGlow)"/>
+  <circle cx="604" cy="188" r="3.5" fill="#22ff22" filter="url(#softGlow)"/>
+  <circle cx="604" cy="208" r="3.5" fill="#ff2222" filter="url(#softGlow)"/>
+  <circle cx="604" cy="228" r="3.5" fill="#ff2222" filter="url(#softGlow)"/>
+  <circle cx="604" cy="248" r="3.5" fill="#22ff22" filter="url(#softGlow)"/>
+  <circle cx="604" cy="268" r="3.5" fill="#ff2222" filter="url(#softGlow)"/>
+  <circle cx="604" cy="288" r="3.5" fill="#ffcc00" filter="url(#softGlow)"/>
+  <circle cx="604" cy="308" r="3.5" fill="#22ff22" filter="url(#softGlow)"/>
+  <circle cx="604" cy="328" r="3.5" fill="#ff2222" filter="url(#softGlow)"/>
+  <circle cx="604" cy="348" r="3.5" fill="#ff2222" filter="url(#softGlow)"/>
+  <circle cx="604" cy="368" r="3.5" fill="#22ff22" filter="url(#softGlow)"/>
+  <circle cx="604" cy="388" r="3.5" fill="#ffcc00" filter="url(#softGlow)"/>
+
+  <!-- ANGRY EYES at top of rack -->
+  <!-- Eye glow halos -->
+  <ellipse cx="632" cy="86" rx="28" ry="16" fill="#aa0000" opacity="0.25" filter="url(#redGlow)"/>
+  <ellipse cx="704" cy="86" rx="28" ry="16" fill="#aa0000" opacity="0.25" filter="url(#redGlow)"/>
+  <!-- Eye shapes (angry diamond/slit) -->
+  <path d="M610,83 Q632,74 654,83 Q632,100 610,83" fill="#dd0000"/>
+  <path d="M682,83 Q704,74 726,83 Q704,100 682,83" fill="#dd0000"/>
+  <!-- Pupils -->
+  <circle cx="632" cy="87" r="6.5" fill="#300000"/>
+  <circle cx="704" cy="87" r="6.5" fill="#300000"/>
+  <!-- Eye gleam -->
+  <circle cx="627" cy="83" r="2.5" fill="#ff7777" opacity="0.85"/>
+  <circle cx="699" cy="83" r="2.5" fill="#ff7777" opacity="0.85"/>
+  <!-- Angry eyebrows (V-shape, inward-down) -->
+  <line x1="608" y1="73" x2="654" y2="80" stroke="#ff3333" stroke-width="4" stroke-linecap="round"/>
+  <line x1="682" y1="80" x2="726" y2="73" stroke="#ff3333" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- MOUTH / TEETH on left face of rack -->
+  <!-- Mouth cavity (dark red interior) -->
+  <path d="M572,188 Q536,208 532,292 Q536,372 572,390 L572,188Z" fill="#3d0000"/>
+  <!-- Mouth lip/gum outline -->
+  <path d="M572,188 Q540,206 536,292 Q540,373 572,390"
+        stroke="#5c1010" stroke-width="3" fill="none"/>
+
+  <!-- TEETH: triangles pointing LEFT from x=572 -->
+  <!-- Upper set -->
+  <polygon points="572,194 542,207 572,214" fill="#e4e4d8" stroke="#c8c8b4" stroke-width="0.5"/>
+  <polygon points="572,216 541,229 572,236" fill="#e4e4d8" stroke="#c8c8b4" stroke-width="0.5"/>
+  <polygon points="572,238 540,251 572,258" fill="#e4e4d8" stroke="#c8c8b4" stroke-width="0.5"/>
+  <polygon points="572,260 541,273 572,280" fill="#e4e4d8" stroke="#c8c8b4" stroke-width="0.5"/>
+  <!-- Middle gap (dark red tongue) -->
+  <ellipse cx="554" cy="291" rx="16" ry="9" fill="#aa2222"/>
+  <!-- Lower set -->
+  <polygon points="572,302 541,312 572,322" fill="#e4e4d8" stroke="#c8c8b4" stroke-width="0.5"/>
+  <polygon points="572,324 542,334 572,344" fill="#e4e4d8" stroke="#c8c8b4" stroke-width="0.5"/>
+  <polygon points="572,346 543,356 572,366" fill="#e4e4d8" stroke="#c8c8b4" stroke-width="0.5"/>
+  <polygon points="572,368 544,377 572,386" fill="#e4e4d8" stroke="#c8c8b4" stroke-width="0.5"/>
+  <!-- Drool -->
+  <path d="M543,296 Q539,318 541,346" stroke="#3388cc" stroke-width="3"
+        fill="none" opacity="0.55" stroke-linecap="round"/>
+  <ellipse cx="541" cy="350" rx="7" ry="6" fill="#3388cc" opacity="0.45"/>
+
+  <!-- Server reaching arm/cable claw -->
+  <path d="M572,235 Q525,265 508,308" stroke="#282828" stroke-width="14"
+        stroke-linecap="round" fill="none"/>
+  <path d="M572,235 Q525,265 508,308" stroke="#383838" stroke-width="8"
+        stroke-linecap="round" fill="none"/>
+  <!-- Claw fingers -->
+  <line x1="508" y1="308" x2="486" y2="323" stroke="#282828" stroke-width="7" stroke-linecap="round"/>
+  <line x1="508" y1="308" x2="505" y2="330" stroke="#282828" stroke-width="7" stroke-linecap="round"/>
+  <line x1="508" y1="308" x2="527" y2="326" stroke="#282828" stroke-width="7" stroke-linecap="round"/>
+
+
+  <!-- ===================== LABEL ===================== -->
+  <text x="400" y="482" font-family="Courier New,monospace" font-size="13"
+        fill="#484868" text-anchor="middle" letter-spacing="3">claude-cache</text>
+</svg>

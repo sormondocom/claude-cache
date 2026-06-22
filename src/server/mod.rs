@@ -22,12 +22,14 @@ use crate::backend::{MessagesRequest, MessagesResponse};
 use crate::budget::BudgetLedger;
 use crate::cache::CacheStore;
 use crate::config::AppConfig;
+use crate::error::ProxyError;
 use crate::federation::{entry_to_federated, AnnouncePayload, FederationClient, PeerDescriptor, SemanticFederatedEntry, SemanticLookupRequest};
 use crate::identity::announce_message;
 use crate::identity::NodeIdentity;
 use crate::router::{RouteDecision, Router};
 use crate::trust::TrustStore;
 use crate::backend::anthropic::AnthropicBackend;
+use crate::learning::Distiller;
 
 // ── App State ──────────────────────────────────────────────────────────────
 
@@ -46,7 +48,7 @@ pub struct AppState {
     pub is_cnc:           bool,
     pub auto_promote_peers: bool,
     pub api_base_url:     String,
-    pub api_creds:        crate::auth::Credentials,
+    pub api_creds:        crate::auth::CredentialStore,
     /// Static bearer token for the management portal.  `None` = auth disabled.
     /// Set via `CLAUDE_CACHE_PORTAL_TOKEN` env var — never stored in config files.
     pub portal_token:     Option<String>,
@@ -55,6 +57,28 @@ pub struct AppState {
     /// Set when an Anthropic API call returns a credit-exhaustion error.
     /// While true, /v1/messages bypasses proxy routing and forwards with client credentials.
     pub credits_exhausted: AtomicBool,
+    /// Operator-controlled bypass: when set, all /v1/messages requests skip proxy
+    /// routing and go directly to Anthropic via credit-bypass path.
+    /// Toggle via POST /api/bypass/enable and /api/bypass/disable.
+    pub manual_bypass: AtomicBool,
+    /// Domain knowledge distiller — shared so the management endpoint can trigger
+    /// on-demand synthesis without re-creating the worker.
+    pub distiller: Arc<Distiller>,
+    /// Cached graph snapshot with timestamp for 30-second TTL (Task 13).
+    pub graph_cache: tokio::sync::Mutex<Option<(serde_json::Value, std::time::Instant)>>,
+    /// Shared HTTP client for passthrough and credit-bypass forwarding.
+    /// Reusing a single client preserves the connection pool across requests.
+    pub http_client: reqwest::Client,
+}
+
+// ── Credential accessor helper ─────────────────────────────────────────────
+
+impl AppState {
+    /// Current proxy credentials — reads the live ArcSwap value so callers
+    /// always get the latest token even after an OAuth rotation.
+    pub fn proxy_creds(&self) -> std::sync::Arc<crate::auth::Credentials> {
+        self.api_creds.get()
+    }
 }
 
 pub type SharedState = Arc<AppState>;
@@ -94,8 +118,10 @@ pub fn build_router(state: SharedState) -> AxumRouter {
         .route("/stats",        get(handle_stats))
         .route("/api/pricing",       post(handle_update_pricing))
         .route("/api/spend",         get(handle_spend))
-        .route("/api/credits/reset", post(handle_credits_reset))
-        .route("/api/config/reload", post(handle_config_reload))
+        .route("/api/credits/reset",  post(handle_credits_reset))
+        .route("/api/bypass/enable",  post(handle_bypass_enable))
+        .route("/api/bypass/disable", post(handle_bypass_disable))
+        .route("/api/config/reload",  post(handle_config_reload))
         .route("/v1/trust",              get(handle_trust_list))
         .route("/v1/trust/:node_id",     post(handle_trust_promote))
         .route("/v1/evict/:node_id",     post(handle_evict))
@@ -106,6 +132,20 @@ pub fn build_router(state: SharedState) -> AxumRouter {
         .route("/api/peers/health", get(crate::portal::handle_peer_health))
         .route("/api/routing",      get(crate::portal::handle_routing_log))
         .route("/api/cache/search", get(crate::portal::handle_cache_search))
+        .route("/api/learning/knowledge",  get(crate::portal::handle_learning_knowledge))
+        .route("/api/learning/thresholds", get(crate::portal::handle_learning_thresholds))
+        .route("/api/learning/feedback",   get(crate::portal::handle_learning_feedback))
+        .route("/api/learning/contrasts",    get(crate::portal::handle_learning_contrasts))
+        .route("/api/learning/brain",        get(crate::portal::handle_learning_brain))
+        .route("/api/learning/calibration",  get(crate::portal::handle_learning_calibration))
+        .route("/api/learning/draft-verify", get(crate::portal::handle_learning_draft_verify))
+        .route("/api/learning/forgetting",   get(crate::portal::handle_learning_forgetting))
+        .route("/api/learning/distill/:domain", post(crate::portal::handle_learning_distill))
+        .route("/graph",                       get(crate::portal::handle_graph_page))
+        .route("/chat",                        get(crate::portal::handle_chat_page))
+        .route("/api/graph/data",              get(crate::portal::handle_graph_data))
+        .route("/api/graph/search",            get(crate::portal::handle_graph_search))
+        .route("/api/graph/trace/:id",         get(crate::portal::handle_graph_trace))
         .route("/v1/cache/export",             get(handle_export_cache))
         .route("/v1/cache/seed",               post(handle_seed_cache))
         .route("/v1/cache/entries/:id/pin",    post(handle_pin_cache_entry))
@@ -139,17 +179,41 @@ pub fn build_router(state: SharedState) -> AxumRouter {
             }))
     };
 
-    // Remaining public routes: health check and federation peer endpoints
-    // (federation uses Ed25519-based authentication, not portal token).
+    // Federation endpoints: rate-limited to 600 req/min (10/sec) to protect the
+    // node from peer storms without blocking legitimate mesh traffic.
+    let fed_limiter: Arc<DefaultDirectRateLimiter> = Arc::new(
+        RateLimiter::direct(Quota::per_minute(NonZeroU32::new(600).unwrap()))
+    );
+    let federation_router = {
+        let lim = fed_limiter;
+        AxumRouter::new()
+            .route("/v1/federation/lookup/:hash", get(handle_federation_lookup))
+            .route("/v1/federation/announce",    post(handle_federation_announce))
+            .route("/v1/federation/peers",       get(handle_federation_peers))
+            .route("/v1/federation/peers/list",  get(handle_federation_peers_list))
+            .route("/v1/federation/semantic",    post(handle_federation_semantic))
+            .route("/v1/federation/revocations", get(handle_get_revocations)
+                                                 .post(handle_receive_revocation))
+            .route("/v1/federation/knowledge/:domain", get(handle_federation_knowledge))
+            .layer(middleware::from_fn(move |req: axum::extract::Request, next: middleware::Next| {
+                let lim = lim.clone();
+                async move {
+                    if lim.check().is_err() {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [(axum::http::header::RETRY_AFTER, "1")],
+                            Json(json!({"error": "federation rate limit exceeded"})),
+                        ).into_response();
+                    }
+                    next.run(req).await
+                }
+            }))
+    };
+
+    // Remaining public routes: health check and passthrough fallback.
     let public = AxumRouter::new()
-        .route("/health",                    get(handle_health))
-        .route("/v1/federation/lookup/:hash", get(handle_federation_lookup))
-        .route("/v1/federation/announce",    post(handle_federation_announce))
-        .route("/v1/federation/peers",       get(handle_federation_peers))
-        .route("/v1/federation/peers/list",  get(handle_federation_peers_list))
-        .route("/v1/federation/semantic",    post(handle_federation_semantic))
-        .route("/v1/federation/revocations", get(handle_get_revocations)
-                                             .post(handle_receive_revocation))
+        .route("/health", get(handle_health))
+        .merge(federation_router)
         .fallback(handle_passthrough);
 
     AxumRouter::new()
@@ -172,7 +236,9 @@ async fn handle_messages(
 
     let client_auth = extract_client_auth(&headers);
 
-    if state.credits_exhausted.load(Ordering::Relaxed) {
+    if state.credits_exhausted.load(Ordering::Relaxed)
+        || state.manual_bypass.load(Ordering::Relaxed)
+    {
         return handle_credit_bypass(&state, req, client_auth).await;
     }
 
@@ -198,21 +264,49 @@ async fn handle_sync_messages(
                 "routed"
             );
             let mut resp = Json(routed.response).into_response();
-            resp.headers_mut().insert(
-                "x-router-source",
-                HeaderValue::from_str(routed.decision.as_str()).unwrap_or_else(|_| HeaderValue::from_static("unknown")),
-            );
+            {
+                let h = resp.headers_mut();
+                let t = &routed.trace;
+                let hv = |s: String| HeaderValue::from_str(&s).unwrap_or_else(|_| HeaderValue::from_static(""));
+                h.insert("x-router-source",
+                    HeaderValue::from_str(routed.decision.as_str()).unwrap_or_else(|_| HeaderValue::from_static("unknown")));
+                if !t.domain.is_empty() {
+                    h.insert("x-cc-domain",  hv(t.domain.clone()));
+                    h.insert("x-cc-intent",  hv(t.intent.clone()));
+                }
+                if t.novelty_score > 0.0 {
+                    h.insert("x-cc-novelty",     hv(format!("{:.3}", t.novelty_score)));
+                    h.insert("x-cc-complexity",  hv(format!("{:.3}", t.complexity_score)));
+                    h.insert("x-cc-consequence", hv(format!("{:.3}", t.consequence_score)));
+                }
+                if t.l3_threshold > 0.0 {
+                    h.insert("x-cc-l3-threshold", hv(format!("{:.2}", t.l3_threshold)));
+                    if t.l3_adapted {
+                        h.insert("x-cc-l3-base",     hv(format!("{:.2}", t.l3_base)));
+                        h.insert("x-cc-l3-adapted",  HeaderValue::from_static("1"));
+                    }
+                }
+                if t.l2_doc {
+                    h.insert("x-cc-l2-doc-chars", hv(t.l2_doc_chars.to_string()));
+                }
+                if t.l1_shots > 0 {
+                    h.insert("x-cc-l1-shots",   hv(t.l1_shots.to_string()));
+                    h.insert("x-cc-l1-min-sim", hv(format!("{:.3}", t.l1_min_sim)));
+                    h.insert("x-cc-l1-max-sim", hv(format!("{:.3}", t.l1_max_sim)));
+                }
+                if t.l5_contrast {
+                    h.insert("x-cc-l5-contrast", HeaderValue::from_static("1"));
+                }
+                if let Some(conf) = t.confidence {
+                    h.insert("x-cc-confidence", hv(format!("{:.3}", conf)));
+                }
+                if let Some(ref mr) = t.miss_reason {
+                    h.insert("x-cc-miss-reason", hv(mr.clone()));
+                }
+            }
             resp
         }
-        Err(e) if is_credit_exhausted(&e.to_string()) => {
-            error!("API credit balance exhausted — proxy bypass activated. POST /api/credits/reset to restore after topping up.");
-            state.credits_exhausted.store(true, Ordering::Relaxed);
-            handle_credit_bypass(&state, req, client_auth).await
-        }
-        Err(e) => {
-            warn!("router error: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
-        }
+        Err(e) => route_error(e, &state, req, client_auth).await,
     }
 }
 
@@ -233,29 +327,109 @@ async fn handle_stream_messages(
 
     match state.router.route(&non_stream_req).await {
         Ok(routed) if routed.decision != RouteDecision::Api => {
-            // Cache/local hit — synthesize SSE
             info!("stream: synthesizing SSE from {}", routed.decision.as_str());
-            return synthesize_sse(routed.response).into_response();
+            let source = routed.decision.as_str();
+            let trace  = routed.trace;
+            let mut resp = synthesize_sse(routed.response);
+            {
+                let h  = resp.headers_mut();
+                let hv = |s: String| HeaderValue::from_str(&s).unwrap_or_else(|_| HeaderValue::from_static(""));
+                if let Ok(v) = HeaderValue::from_str(source) { h.insert("x-router-source", v); }
+                if !trace.domain.is_empty() {
+                    h.insert("x-cc-domain", hv(trace.domain.clone()));
+                    h.insert("x-cc-intent", hv(trace.intent.clone()));
+                }
+                if trace.novelty_score > 0.0 {
+                    h.insert("x-cc-novelty",     hv(format!("{:.3}", trace.novelty_score)));
+                    h.insert("x-cc-complexity",  hv(format!("{:.3}", trace.complexity_score)));
+                    h.insert("x-cc-consequence", hv(format!("{:.3}", trace.consequence_score)));
+                }
+                if trace.l3_threshold > 0.0 {
+                    h.insert("x-cc-l3-threshold", hv(format!("{:.2}", trace.l3_threshold)));
+                    if trace.l3_adapted {
+                        h.insert("x-cc-l3-base",    hv(format!("{:.2}", trace.l3_base)));
+                        h.insert("x-cc-l3-adapted", HeaderValue::from_static("1"));
+                    }
+                }
+                if trace.l2_doc { h.insert("x-cc-l2-doc-chars", hv(trace.l2_doc_chars.to_string())); }
+                if trace.l1_shots > 0 {
+                    h.insert("x-cc-l1-shots",   hv(trace.l1_shots.to_string()));
+                    h.insert("x-cc-l1-min-sim", hv(format!("{:.3}", trace.l1_min_sim)));
+                    h.insert("x-cc-l1-max-sim", hv(format!("{:.3}", trace.l1_max_sim)));
+                }
+                if trace.l5_contrast { h.insert("x-cc-l5-contrast", HeaderValue::from_static("1")); }
+                if let Some(conf) = trace.confidence { h.insert("x-cc-confidence", hv(format!("{:.3}", conf))); }
+                if let Some(ref mr) = trace.miss_reason { h.insert("x-cc-miss-reason", hv(mr.clone())); }
+            }
+            return resp;
         }
-        Err(e) if is_credit_exhausted(&e.to_string()) => {
-            error!("API credit balance exhausted — proxy bypass activated. POST /api/credits/reset to restore after topping up.");
-            state.credits_exhausted.store(true, Ordering::Relaxed);
-            return handle_credit_bypass(&state, req, client_auth).await;
+        Ok(routed) => {
+            // API was called non-streaming by the router; result is already cached.
+            // Synthesize SSE rather than making a second Anthropic call.
+            info!("stream: synthesizing SSE from api (non-stream result cached)");
+            let trace = routed.trace;
+            let mut resp = synthesize_sse(routed.response);
+            {
+                let h  = resp.headers_mut();
+                let hv = |s: String| HeaderValue::from_str(&s).unwrap_or_else(|_| HeaderValue::from_static(""));
+                h.insert("x-router-source", HeaderValue::from_static("api"));
+                if !trace.domain.is_empty() {
+                    h.insert("x-cc-domain", hv(trace.domain.clone()));
+                    h.insert("x-cc-intent", hv(trace.intent.clone()));
+                }
+                if trace.novelty_score > 0.0 {
+                    h.insert("x-cc-novelty",     hv(format!("{:.3}", trace.novelty_score)));
+                    h.insert("x-cc-complexity",  hv(format!("{:.3}", trace.complexity_score)));
+                    h.insert("x-cc-consequence", hv(format!("{:.3}", trace.consequence_score)));
+                }
+                if trace.l3_threshold > 0.0 {
+                    h.insert("x-cc-l3-threshold", hv(format!("{:.2}", trace.l3_threshold)));
+                    if trace.l3_adapted {
+                        h.insert("x-cc-l3-base",    hv(format!("{:.2}", trace.l3_base)));
+                        h.insert("x-cc-l3-adapted", HeaderValue::from_static("1"));
+                    }
+                }
+                if trace.l2_doc { h.insert("x-cc-l2-doc-chars", hv(trace.l2_doc_chars.to_string())); }
+                if trace.l1_shots > 0 {
+                    h.insert("x-cc-l1-shots",   hv(trace.l1_shots.to_string()));
+                    h.insert("x-cc-l1-min-sim", hv(format!("{:.3}", trace.l1_min_sim)));
+                    h.insert("x-cc-l1-max-sim", hv(format!("{:.3}", trace.l1_max_sim)));
+                }
+                if trace.l5_contrast { h.insert("x-cc-l5-contrast", HeaderValue::from_static("1")); }
+                if let Some(conf) = trace.confidence { h.insert("x-cc-confidence", hv(format!("{:.3}", conf))); }
+                if let Some(ref mr) = trace.miss_reason { h.insert("x-cc-miss-reason", hv(mr.clone())); }
+            }
+            return resp;
         }
-        _ => {}
+        Err(e) => {
+            // Typed ProxyErrors have precise semantics — return immediately.
+            // Truly generic errors (embedding failure, DB blip) fall through to
+            // the direct streaming path as a best-effort fallback.
+            let msg = e.to_string();
+            if e.downcast_ref::<ProxyError>().is_some()
+                || is_credit_exhausted(&msg)
+                || is_rate_limited(&msg)
+            {
+                return route_error(e, &state, req, client_auth).await;
+            }
+            warn!("router error on stream pre-check (falling through to direct stream): {e}");
+        }
     }
 
-    // True streaming passthrough to Anthropic
+    // True streaming passthrough to Anthropic (reached only on router error)
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let anthropic = state.anthropic.clone();
     let router    = state.router.clone();
     let req_clone = req.clone();
 
     tokio::spawn(async move {
+        let embedding = router.embed_if_enabled(&req_clone.prompt_text()).await;
         match anthropic.stream_to_channel(&req_clone, tx.clone()).await {
             Ok(acc) => {
                 info!("stream complete: {} output tokens accumulated", acc.output_tokens);
-                router.cache_streamed(&req_clone, &acc.text, &acc.message_id, acc.input_tokens, acc.output_tokens).await;
+                if !acc.has_tool_use {
+                    router.cache_streamed(&req_clone, &acc.text, &acc.message_id, acc.input_tokens, acc.output_tokens, &acc.stop_reason, embedding).await;
+                }
             }
             Err(e) => warn!("stream error: {e}"),
         }
@@ -272,7 +446,7 @@ async fn handle_stream_messages(
         .unwrap()
 }
 
-fn synthesize_sse(resp: MessagesResponse) -> impl IntoResponse {
+fn synthesize_sse(resp: MessagesResponse) -> Response {
     use std::fmt::Write;
     let mut sse = String::new();
     let id = &resp.id;
@@ -285,16 +459,43 @@ fn synthesize_sse(resp: MessagesResponse) -> impl IntoResponse {
     let _ = writeln!(sse);
 
     for (i, block) in resp.content.iter().enumerate() {
+        let block_start = match block.kind.as_str() {
+            "text" => json!({ "type": "text", "text": "" }),
+            "thinking" => json!({ "type": "thinking", "thinking": "" }),
+            "tool_use" => {
+                let id   = block.extra.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = block.extra.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                json!({ "type": "tool_use", "id": id, "name": name, "input": {} })
+            }
+            _ => json!({ "type": block.kind }),
+        };
         let _ = writeln!(sse, "event: content_block_start");
         let _ = writeln!(sse, "data: {}", serde_json::to_string(&json!({
-            "type": "content_block_start", "index": i, "content_block": { "type": block.kind, "text": "" }
+            "type": "content_block_start", "index": i, "content_block": block_start
         })).unwrap_or_default());
         let _ = writeln!(sse);
 
         if let Some(text) = &block.text {
+            let delta = if block.kind == "thinking" {
+                json!({ "type": "thinking_delta", "thinking": text })
+            } else {
+                json!({ "type": "text_delta", "text": text })
+            };
             let _ = writeln!(sse, "event: content_block_delta");
             let _ = writeln!(sse, "data: {}", serde_json::to_string(&json!({
-                "type": "content_block_delta", "index": i, "delta": { "type": "text_delta", "text": text }
+                "type": "content_block_delta", "index": i, "delta": delta
+            })).unwrap_or_default());
+            let _ = writeln!(sse);
+        }
+
+        if block.kind == "tool_use" {
+            let input = block.extra.get("input").cloned()
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            let partial_json = serde_json::to_string(&input).unwrap_or_default();
+            let _ = writeln!(sse, "event: content_block_delta");
+            let _ = writeln!(sse, "data: {}", serde_json::to_string(&json!({
+                "type": "content_block_delta", "index": i,
+                "delta": { "type": "input_json_delta", "partial_json": partial_json }
             })).unwrap_or_default());
             let _ = writeln!(sse);
         }
@@ -316,6 +517,7 @@ fn synthesize_sse(resp: MessagesResponse) -> impl IntoResponse {
     Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
         .header("x-router-source", "cache-sse")
         .body(Body::from(sse))
         .unwrap()
@@ -333,6 +535,7 @@ async fn handle_health(State(state): State<SharedState>) -> Json<Value> {
         "cache_entries": stats.total_entries,
         "federation_peers": state.federation.peer_count().await,
         "credits_exhausted": state.credits_exhausted.load(Ordering::Relaxed),
+        "manual_bypass": state.manual_bypass.load(Ordering::Relaxed),
     }))
 }
 
@@ -358,6 +561,7 @@ async fn handle_stats(State(state): State<SharedState>) -> Json<Value> {
         }),
         "spend_7d": summary,
         "credits_exhausted": state.credits_exhausted.load(Ordering::Relaxed),
+        "manual_bypass": state.manual_bypass.load(Ordering::Relaxed),
     }))
 }
 
@@ -384,12 +588,21 @@ async fn handle_spend(State(state): State<SharedState>) -> Json<Value> {
 
 async fn handle_config_reload(State(state): State<SharedState>) -> Response {
     match AppConfig::load(&state.config_path) {
-        Ok(new_cfg) => {
+        Ok(mut new_cfg) => {
+            if let Err(e) = new_cfg.validate() {
+                warn!("config reload rejected — validation failed: {e}");
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": format!("validation failed: {e}") })),
+                ).into_response();
+            }
             let old = state.cfg.load();
             if old.cache.db_path != new_cfg.cache.db_path
                 || old.budget.db_path != new_cfg.budget.db_path
             {
                 warn!("config reload: db_path changes ignored — restart required");
+                new_cfg.cache.db_path  = old.cache.db_path.clone();
+                new_cfg.budget.db_path = old.budget.db_path.clone();
             }
             state.cfg.store(Arc::new(new_cfg));
             info!("config reloaded from {}", state.config_path);
@@ -434,7 +647,7 @@ async fn handle_federation_announce(
 
     // 2. Hard-reject evicted nodes immediately
     if state.trust.is_evicted(&payload.node_id).await {
-        warn!("federation announce from evicted node {}", &payload.node_id[..16]);
+        warn!("federation announce from evicted node {}", &payload.node_id[..16.min(payload.node_id.len())]);
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -470,7 +683,7 @@ async fn handle_federation_announce(
     if !trust_state.is_trusted() {
         info!(
             "federation announce from untrusted node {} ({} hashes ignored)",
-            &payload.node_id[..16], payload.hashes.len()
+            &payload.node_id[..16.min(payload.node_id.len())], payload.hashes.len()
         );
         return Json(json!({
             "ok":     true,
@@ -481,7 +694,7 @@ async fn handle_federation_announce(
 
     info!(
         "federation announce from trusted node {} ({} hashes)",
-        &payload.node_id[..16], payload.hashes.len()
+        &payload.node_id[..16.min(payload.node_id.len())], payload.hashes.len()
     );
 
     // 6. Process gossip peer list — register any unknown non-evicted peers as Untrusted
@@ -530,11 +743,14 @@ async fn handle_federation_semantic(
     State(state): State<SharedState>,
     Json(req):    Json<SemanticLookupRequest>,
 ) -> Response {
+    // Use empty model string so all stored embeddings match (federation peers
+    // may use a different embedding model — we serve what we have).
     match state.cache.lookup_semantic(
         &req.domain,
         &req.embedding,
         req.sim_threshold,
         req.limit.min(10), // cap peer results at 10 to limit response size
+        "",
     ).await {
         Ok(hits) => {
             let entries: Vec<SemanticFederatedEntry> = hits
@@ -551,6 +767,40 @@ async fn handle_federation_semantic(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
         }
     }
+}
+
+/// Serve the local node's distilled knowledge for `domain` to federation peers.
+/// Peers call this during distillation to blend mesh-wide learning into their
+/// local synthesis.  Includes the knowledge doc, per-intent calibration biases,
+/// and the most recent contrast pairs (labeled failure cases).
+async fn handle_federation_knowledge(
+    State(state): State<SharedState>,
+    Path(domain): Path<String>,
+) -> Response {
+    let knowledge_doc = state.cache.load_knowledge_doc(&domain).await.ok().flatten();
+
+    let calibration_window = state.cfg.load().learning.calibration_window_secs as i64;
+    let all_biases = state.cache.load_calibration_biases(calibration_window).await.unwrap_or_default();
+    let mut calibration_biases = serde_json::Map::new();
+    for ((d, intent), bias) in all_biases {
+        if d == domain {
+            calibration_biases.insert(intent, serde_json::Value::from(bias));
+        }
+    }
+
+    let contrast_pairs = state.cache.contrast_pairs_for_domain(&domain, 5).await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| json!({ "intent": p.intent, "wrong": p.local_attempt, "correct": p.correct_answer }))
+        .collect::<Vec<_>>();
+
+    Json(json!({
+        "domain":             domain,
+        "node_id":            state.node_id,
+        "knowledge_doc":      knowledge_doc,
+        "calibration_biases": serde_json::Value::Object(calibration_biases),
+        "contrast_pairs":     contrast_pairs,
+    })).into_response()
 }
 
 async fn handle_federation_peers(State(state): State<SharedState>) -> Json<Value> {
@@ -682,16 +932,25 @@ async fn handle_seed_cache(
     State(state): State<SharedState>,
     Json(body):   Json<SeedCacheBody>,
 ) -> Response {
-    use crate::domain::{classify, ShapeKey};
+    use crate::domain::classify;
 
     let shape = if let Some(ref d) = body.domain {
-        ShapeKey { domain: d.clone(), intent: "generate".into(), complexity: 0.3 }
+        let mut s = classify(&body.prompt);
+        s.domain = d.clone();
+        s
     } else {
         classify(&body.prompt)
     };
 
+    if let Err(e) = serde_json::from_str::<crate::backend::MessagesResponse>(&body.response) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("response is not a valid MessagesResponse: {e}") })),
+        ).into_response();
+    }
+
     let model = body.model.as_deref().unwrap_or("seeded");
-    let ttl   = if body.pinned { None } else { Some(604_800u64) }; // 7 days for seeded entries
+    let ttl   = if body.pinned { None } else { Some(state.cfg.load().domain_ttl(shape.domain.as_str())) };
 
     match state.cache.store(
         &shape,
@@ -756,7 +1015,7 @@ async fn handle_export_cache(
     State(state): State<SharedState>,
     Query(params): Query<ExportParams>,
 ) -> Response {
-    let limit       = params.limit.unwrap_or(1000).min(5000);
+    let limit       = params.limit.unwrap_or(1000).max(1).min(5000);
     let pinned_only = params.pinned.unwrap_or(false);
 
     match state.cache.export_entries(params.domain.as_deref(), pinned_only, limit).await {
@@ -778,10 +1037,98 @@ async fn handle_export_cache(
     }
 }
 
-// ── Credit exhaustion helpers ─────────────────────────────────────────────
+// ── Error dispatch ────────────────────────────────────────────────────────
+
+/// Map any router error to an appropriate HTTP response.
+///
+/// Priority order:
+/// 1. Typed `ProxyError` — precise HTTP code + structured JSON body + Retry-After
+/// 2. Legacy string matches — backward compat for untyped errors
+/// 3. Catch-all 500
+async fn route_error(
+    e:           anyhow::Error,
+    state:       &SharedState,
+    req:         MessagesRequest,
+    client_auth: Option<(String, String)>,
+) -> Response {
+    if let Some(proxy_err) = e.downcast_ref::<ProxyError>() {
+        match proxy_err {
+            ProxyError::CreditExhausted(_) => {
+                error!(
+                    error_code = "CC-E005",
+                    "API credit balance exhausted — proxy bypass activated. \
+                     POST /api/credits/reset to restore after topping up."
+                );
+                state.credits_exhausted.store(true, Ordering::Relaxed);
+                return handle_credit_bypass(state, req, client_auth).await;
+            }
+            other => {
+                let status = other.http_status();
+                let code   = other.code();
+                let etype  = other.error_type();
+                let msg    = other.to_string();
+                let retry  = other.retry_after_secs();
+                if status.is_server_error() {
+                    error!(error_code = code, "{msg}");
+                } else {
+                    warn!(error_code = code, "{msg}");
+                }
+                let body = json!({
+                    "type": "error",
+                    "error": {"type": etype, "code": code, "message": msg}
+                });
+                let mut resp = (status, Json(body)).into_response();
+                if let Some(secs) = retry {
+                    if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+                        resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+                    }
+                }
+                return resp;
+            }
+        }
+    }
+    // Legacy string-based fallbacks for any errors not yet using typed variants.
+    let msg = e.to_string();
+    if is_credit_exhausted(&msg) {
+        error!(
+            error_code = "CC-E005",
+            "API credit balance exhausted — proxy bypass activated. \
+             POST /api/credits/reset to restore after topping up."
+        );
+        state.credits_exhausted.store(true, Ordering::Relaxed);
+        return handle_credit_bypass(state, req, client_auth).await;
+    }
+    if is_rate_limited(&msg) {
+        warn!(error_code = "CC-E004", "rate limited: {msg}");
+        return (StatusCode::TOO_MANY_REQUESTS, Json(anthropic_error_body(&msg))).into_response();
+    }
+    warn!("router error: {msg}");
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": msg}))).into_response()
+}
+
+// ── Legacy string matchers (fallback for untyped errors) ──────────────────
 
 fn is_credit_exhausted(msg: &str) -> bool {
-    msg.contains("credit balance is too low")
+    let m = msg.to_lowercase();
+    (m.contains("credit") && m.contains("too low"))
+        || m.contains("insufficient_credits")
+        || m.contains("credit balance is too low")
+}
+
+fn is_rate_limited(msg: &str) -> bool {
+    msg.contains("429") && (msg.contains("rate_limit") || msg.contains("Too Many Requests"))
+}
+
+/// Extract the Anthropic JSON error body from a bail! string like
+/// "Anthropic API 429 Too Many Requests: {...}".  Falls back to a
+/// generic rate_limit_error envelope if parsing fails.
+fn anthropic_error_body(err_msg: &str) -> Value {
+    if let Some(pos) = err_msg.find('{') {
+        if let Ok(v) = serde_json::from_str::<Value>(&err_msg[pos..]) {
+            return v;
+        }
+    }
+    json!({"type": "error", "error": {"type": "rate_limit_error", "message": err_msg}})
 }
 
 fn extract_client_auth(headers: &HeaderMap) -> Option<(String, String)> {
@@ -821,13 +1168,7 @@ async fn handle_credit_bypass(
         if is_stream { "stream" } else { "request" });
 
     let url = format!("{}/v1/messages", state.api_base_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .use_rustls_tls()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let mut builder = client
+    let mut builder = state.http_client
         .post(&url)
         .header(auth_name.as_str(), auth_val.as_str())
         .header("anthropic-version", "2023-06-01")
@@ -874,21 +1215,54 @@ async fn handle_credits_reset(State(state): State<SharedState>) -> Json<Value> {
     Json(json!({ "ok": true, "was_exhausted": was_exhausted, "proxy_mode": "restored" }))
 }
 
+async fn handle_bypass_enable(State(state): State<SharedState>) -> Json<Value> {
+    let was_active = state.manual_bypass.swap(true, Ordering::Relaxed);
+    if !was_active {
+        info!("manual bypass enabled — all /v1/messages will forward directly to Anthropic");
+    }
+    Json(json!({ "ok": true, "bypass": true, "was_active": was_active }))
+}
+
+async fn handle_bypass_disable(State(state): State<SharedState>) -> Json<Value> {
+    let was_active = state.manual_bypass.swap(false, Ordering::Relaxed);
+    if was_active {
+        info!("manual bypass disabled — proxy routing restored");
+    }
+    Json(json!({ "ok": true, "bypass": false, "was_active": was_active }))
+}
+
 // ── Passthrough fallback ───────────────────────────────────────────────────
 
 async fn handle_passthrough(
     State(state): State<SharedState>,
     req:          axum::extract::Request,
 ) -> Response {
+    // Only proxy paths that belong to the Anthropic API — anything else is a 404.
+    if !req.uri().path().starts_with("/v1/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     let method  = req.method().clone();
     let uri     = req.uri().clone();
     let headers = req.headers().clone();
-    let body    = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap_or_default();
+
+    // Cap request body to 10 MB to prevent OOM from oversized payloads.
+    const MAX_BODY: usize = 10 * 1024 * 1024;
+    let body = match axum::body::to_bytes(req.into_body(), MAX_BODY).await {
+        Ok(b) => b,
+        Err(_) => return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": "request body exceeds 10 MB limit"})),
+        ).into_response(),
+    };
 
     let url = format!("{}{}", state.api_base_url.trim_end_matches('/'), uri.path_and_query().map(|p| p.as_str()).unwrap_or(""));
 
-    let mut builder = reqwest::Client::new()
-        .request(reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(), &url);
+    let method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let mut builder = state.http_client.request(method, &url);
 
     // Forward headers, replacing auth
     for (k, v) in headers.iter() {
@@ -901,11 +1275,12 @@ async fn handle_passthrough(
         }
     }
 
-    // Inject auth
-    builder = if state.api_creds.api_key.starts_with("sk-ant-oat") {
-        builder.header("Authorization", format!("Bearer {}", state.api_creds.api_key))
+    // Inject auth — read the live credential (may have rotated since startup)
+    let proxy_creds = state.proxy_creds();
+    builder = if proxy_creds.api_key.starts_with("sk-ant-oat") {
+        builder.header("Authorization", format!("Bearer {}", proxy_creds.api_key))
     } else {
-        builder.header("x-api-key", &state.api_creds.api_key)
+        builder.header("x-api-key", &proxy_creds.api_key)
     };
 
     builder = builder

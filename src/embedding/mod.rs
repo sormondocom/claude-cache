@@ -34,31 +34,57 @@ impl OllamaEmbedder {
     }
 }
 
+// New API (Ollama ≥ 0.1.34): POST /api/embed  { model, input }
 #[derive(serde::Serialize)]
-struct EmbedRequest<'a> {
+struct EmbedRequestNew<'a> {
+    model: &'a str,
+    input: &'a str,
+}
+
+#[derive(Deserialize)]
+struct EmbedResponseNew {
+    embeddings: Vec<Vec<f32>>,
+}
+
+// Old API (Ollama < 0.1.34): POST /api/embeddings  { model, prompt }
+#[derive(serde::Serialize)]
+struct EmbedRequestOld<'a> {
     model:  &'a str,
     prompt: &'a str,
 }
 
 #[derive(Deserialize)]
-struct EmbedResponse {
+struct EmbedResponseOld {
     embedding: Vec<f32>,
 }
 
 #[async_trait]
 impl Embedder for OllamaEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let url = format!("{}/api/embeddings", self.base_url);
-        let body = EmbedRequest { model: &self.model, prompt: text };
-        let resp: EmbedResponse = self.client
-            .post(&url)
-            .json(&body)
+        // Try new /api/embed first; fall back to /api/embeddings on 404.
+        let new_url = format!("{}/api/embed", self.base_url);
+        let resp = self.client
+            .post(&new_url)
+            .json(&EmbedRequestNew { model: &self.model, input: text })
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
-        Ok(resp.embedding)
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let old_url = format!("{}/api/embeddings", self.base_url);
+            let old: EmbedResponseOld = self.client
+                .post(&old_url)
+                .json(&EmbedRequestOld { model: &self.model, prompt: text })
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            return Ok(old.embedding);
+        }
+
+        let data: EmbedResponseNew = resp.error_for_status()?.json().await?;
+        data.embeddings.into_iter().next()
+            .ok_or_else(|| anyhow::anyhow!("Ollama embed: empty embeddings array"))
     }
 
     fn model(&self) -> &str {
